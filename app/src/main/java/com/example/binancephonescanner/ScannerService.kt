@@ -1,10 +1,12 @@
 package com.example.binancephonescanner
 
+import android.app.AlarmManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.IBinder
@@ -14,7 +16,6 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
-import java.time.Duration
 import java.time.ZoneId
 import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
@@ -30,10 +31,12 @@ class ScannerService : Service() {
     companion object {
         const val ACTION_START = "com.example.binancephonescanner.START"
         const val ACTION_STOP = "com.example.binancephonescanner.STOP"
+        const val ACTION_ALARM_TICK = "com.example.binancephonescanner.ALARM_TICK"
         const val PREFS = "binance_scanner_state"
         private const val CHANNEL_SERVICE = "scanner_status"
         private const val CHANNEL_ALERTS = "scanner_alerts"
         private const val SERVICE_NOTIFICATION_ID = 1001
+        private const val ALARM_REQUEST_CODE = 2002
         private const val VOLUME_MULTIPLE_THRESHOLD = 4.5
         private const val HIGH_CHANGE_THRESHOLD = 5.0
         private const val LIVE_CHANGE_THRESHOLD = 4.0
@@ -42,7 +45,6 @@ class ScannerService : Service() {
     }
 
     private val running = AtomicBoolean(false)
-    private val scheduler = Executors.newSingleThreadExecutor()
     private val scannerPool = Executors.newFixedThreadPool(8)
     private val progressLock = Any()
     private var lastProgressDone = 0
@@ -64,7 +66,24 @@ class ScannerService : Service() {
                 stopSelf()
                 return START_NOT_STICKY
             }
-            ACTION_START, null -> startMonitoring()
+            ACTION_START -> {
+                startMonitoring()
+            }
+            ACTION_ALARM_TICK -> {
+                // 알람 시간에 도달하여 시스템이 깨웠을 때 실행
+                if (running.get()) {
+                    executeScanAsync()
+                    scheduleNextAlarm() // 다음 정각 50분 알람 예약
+                }
+            }
+            null -> {
+                //비정상 재시작 등의 경우 상태 확인 후 구동 중이었다면 알람 재설정
+                if (prefs.getBoolean("running", false)) {
+                    running.set(true)
+                    updateServiceNotification("감시 실행 중 · 다음 검사 ${nextScanText()}")
+                    scheduleNextAlarm()
+                }
+            }
         }
         return START_STICKY
     }
@@ -76,67 +95,76 @@ class ScannerService : Service() {
         }
         prefs.edit().putBoolean("running", true).apply()
         updateServiceNotification("감시 실행 중 · 다음 검사 ${nextScanText()}")
-        try {
-            scheduler.execute {
-            // Run once immediately so the user can verify that scanning really works.
-            // After this first pass, continue at each hour's :50 mark (Korea time).
-            appendLog("${nowText()} | 감시 시작 | 즉시 검사 시작")
-            try {
-                performScan()
-            } catch (e: Exception) {
-                val message = "첫 검사 오류: ${e.message ?: e.javaClass.simpleName}"
-                appendLog("${nowText()} | 검사 실패 | $message")
-                prefs.edit().putString("last_outcome", "검사 실패").apply()
-                updateServiceNotification("검사 오류 · 인터넷 연결을 확인하세요")
-            }
-
-            while (running.get()) {
-                try {
-                    val waitMs = millisUntilNextCheck()
-                    val nextText = nextScanText()
-                    prefs.edit().putString("next_scan", nextText).apply()
-                    updateServiceNotification("감시 실행 중 · 다음 검사 $nextText")
-                    Thread.sleep(waitMs)
-                    if (!running.get()) break
-                    performScan()
-                } catch (_: InterruptedException) {
-                    Thread.currentThread().interrupt()
-                    break
-                } catch (e: Exception) {
-                    val message = "검사 루프 오류: ${e.message ?: e.javaClass.simpleName}"
-                    appendLog("${nowText()} | 실패 | $message")
-                    prefs.edit().putString("last_outcome", "검사 실패").apply()
-                    updateServiceNotification("검사 오류 · 인터넷 연결을 확인하세요")
-                    try { Thread.sleep(30_000) } catch (_: InterruptedException) { Thread.currentThread().interrupt(); break }
-                }
-            }
-            }
-        } catch (e: Exception) {
-            running.set(false)
-            prefs.edit().putBoolean("running", false)
-                .putString("last_outcome", "감시 시작 실패: ${e.message ?: e.javaClass.simpleName}").apply()
-            appendLog("${nowText()} | 감시 시작 실패 | ${e.message ?: e.javaClass.simpleName}")
-            updateServiceNotification("감시 시작 실패 · 앱을 다시 실행하세요")
+        
+        // 즉시 첫 검사 수행 후 다음 정각 50분 알람 예약
+        executeScanAsync {
+            scheduleNextAlarm()
         }
     }
 
     private fun stopMonitoring() {
         running.set(false)
         prefs.edit().putBoolean("running", false).putString("next_scan", "감시 중지").apply()
-        scheduler.shutdownNow()
+        cancelAlarm()
+        scannerPool.shutdownNow()
     }
 
-    private fun millisUntilNextCheck(): Long {
+    private fun scheduleNextAlarm() {
+        if (!running.get()) return
+        val alarmManager = getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        val intent = Intent(this, ScannerService::class.java).apply {
+            action = ACTION_ALARM_TICK
+        }
+        val pendingIntent = PendingIntent.getService(
+            this, ALARM_REQUEST_CODE, intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val triggerTime = calculateNextCheckMillis()
+        val nextText = nextScanText()
+        prefs.edit().putString("next_scan", nextText).apply()
+        updateServiceNotification("감시 실행 중 · 다음 검사 $nextText")
+
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                // 도즈 모드에서도 확실히 깨우도록 설정
+                alarmManager.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerTime, pendingIntent)
+            } else {
+                alarmManager.setExact(AlarmManager.RTC_WAKEUP, triggerTime, pendingIntent)
+            }
+        } catch (_: SecurityException) {
+            // 안드로이드 13+ 정확한 알람 권한 예외 방어용 일반 알람 fallback
+            alarmManager.set(AlarmManager.RTC_WAKEUP, triggerTime, pendingIntent)
+        }
+    }
+
+    private fun cancelAlarm() {
+        val alarmManager = getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        val intent = Intent(this, ScannerService::class.java).apply {
+            action = ACTION_ALARM_TICK
+        }
+        val pendingIntent = PendingIntent.getService(
+            this, ALARM_REQUEST_CODE, intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        alarmManager.cancel(pendingIntent)
+    }
+
+    private fun calculateNextCheckMillis(): Long {
         val now = ZonedDateTime.now(KST)
-        var target = now.withMinute(50).withSecond(5).withNano(0)
-        if (!now.isBefore(target)) target = target.plusHours(1)
-        return max(1_000L, Duration.between(now, target).toMillis())
+        var target = now.withMinute(50).withSecond(0).withNano(0)
+        if (!now.isBefore(target)) {
+            target = target.plusHours(1)
+        }
+        return target.toInstant().toEpochMilli()
     }
 
     private fun nextScanText(): String {
         val now = ZonedDateTime.now(KST)
-        var target = now.withMinute(50).withSecond(5).withNano(0)
-        if (!now.isBefore(target)) target = target.plusHours(1)
+        var target = now.withMinute(50).withSecond(0).withNano(0)
+        if (!now.isBefore(target)) {
+            target = target.plusHours(1)
+        }
         return target.format(DISPLAY_TIME) + " KST"
     }
 
@@ -150,9 +178,25 @@ class ScannerService : Service() {
         val volumeMultiple: Double
     )
 
+    private fun executeScanAsync(onComplete: (() -> Unit)? = null) {
+        Thread {
+            try {
+                appendLog("${nowText()} | 감시 시작 | 검사 진행")
+                performScan()
+            } catch (e: Exception) {
+                val message = "검사 루프 오류: ${e.message ?: e.javaClass.simpleName}"
+                appendLog("${nowText()} | 실패 | $message")
+                prefs.edit().putString("last_outcome", "검사 실패").apply()
+                updateServiceNotification("검사 오류 · 인터넷 연결을 확인하세요")
+            } finally {
+                onComplete?.invoke()
+            }
+        }.start()
+    }
+
     private fun performScan() {
         val startText = nowText()
-        appendLog("$startText | 검사 시작 (v1.4) | 바이낸스 USDT 무기한 종목 목록 조회 중")
+        appendLog("$startText | 검사 시작 (v1.5) | 바이낸스 USDT 무기한 종목 목록 조회 중")
         updateServiceNotification("바이낸스 종목 목록 조회 중…")
         prefs.edit().putString("last_outcome", "검사 진행 중").apply()
 
@@ -160,7 +204,6 @@ class ScannerService : Service() {
             getSymbols()
         } catch (e: Exception) {
             val endText = nowText()
-            val detail = "종목 목록 조회 실패: ${e.message ?: e.javaClass.simpleName}"
             prefs.edit()
                 .putString("last_scan_time", endText)
                 .putInt("last_scanned", 0)
@@ -300,9 +343,6 @@ class ScannerService : Service() {
         updateServiceNotification("마지막 검사 $endText · ${symbols.size}종목 · 감지 ${matches.size}개 · 실패 $failureCount")
     }
 
-    // Serialize progress updates from the worker threads. Without this, updates can arrive
-    // out of order (e.g. 85/524 posted after 524/524) and Android may drop notification
-    // updates that are posted too quickly, leaving a stale count in the notification bar.
     private fun publishProgress(done: Int, total: Int) {
         synchronized(progressLock) {
             if (done < lastProgressDone) return
@@ -345,7 +385,6 @@ class ScannerService : Service() {
                 return null
             }
 
-            // Binance returns the unfinished current candle as the last row.
             val current = rows.getJSONArray(rows.length() - 1)
             val previousClosed = rows.getJSONArray(rows.length() - 2)
             val openPrice = current.getString(1).toDouble()
@@ -465,16 +504,9 @@ class ScannerService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    override fun onTaskRemoved(rootIntent: Intent?) {
-        // stopWithTask=false keeps the foreground service alive when the app task is swiped away.
-        // START_STICKY asks Android to recreate the service if the process is reclaimed.
-        super.onTaskRemoved(rootIntent)
-    }
-
     override fun onDestroy() {
         running.set(false)
-        // Do not clear persisted running state on unexpected teardown; explicit STOP clears it.
-        scheduler.shutdownNow()
+        cancelAlarm()
         scannerPool.shutdownNow()
         super.onDestroy()
     }
