@@ -1,0 +1,387 @@
+package com.example.binancephonescanner
+
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.net.Uri
+import android.os.PowerManager
+import android.provider.Settings
+import android.os.Build
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.view.Gravity
+import android.view.View
+import android.widget.Button
+import android.widget.LinearLayout
+import android.widget.ProgressBar
+import android.widget.ScrollView
+import android.widget.TextView
+import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import org.json.JSONArray
+import org.json.JSONObject
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+class MainActivity : ComponentActivity() {
+    private val prefs by lazy { getSharedPreferences(ScannerService.PREFS, MODE_PRIVATE) }
+    private val handler = Handler(Looper.getMainLooper())
+    private lateinit var statusText: TextView
+    private lateinit var summaryText: TextView
+    private lateinit var logText: TextView
+    private lateinit var progressText: TextView
+    private lateinit var progressBar: ProgressBar
+    private lateinit var matchContainer: LinearLayout
+    private var renderedMatchSignature = "__NOT_RENDERED__"
+
+    private val refreshTask = object : Runnable {
+        override fun run() {
+            safeRefreshData()
+            handler.postDelayed(this, 5000)
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        try {
+            requestNotificationPermission()
+            buildUi()
+            safeRefreshData()
+        } catch (e: Throwable) {
+            showStartupError(e)
+        }
+    }
+
+    private fun showStartupError(error: Throwable) {
+        val message = error.message ?: error.javaClass.simpleName
+        val screen = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(24), dp(32), dp(24), dp(24))
+            setBackgroundColor(Color.rgb(7, 13, 28))
+        }
+        val title = TextView(this).apply {
+            text = "앱 화면 초기화 실패"
+            textSize = 22f
+            setTextColor(Color.rgb(255, 120, 120))
+            typeface = Typeface.DEFAULT_BOLD
+        }
+        val details = TextView(this).apply {
+            text = "화면을 만드는 중 오류가 발생했습니다.\n\n오류: $message\n\n앱을 종료하지 말고 이 오류 내용을 캡처해 주세요."
+            textSize = 15f
+            setTextColor(Color.WHITE)
+            setPadding(0, dp(16), 0, dp(20))
+        }
+        val retry = Button(this).apply {
+            text = "화면 다시 열기"
+            setOnClickListener {
+                try {
+                    val intent = packageManager.getLaunchIntentForPackage(packageName)
+                    intent?.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_NEW_TASK)
+                    if (intent != null) startActivity(intent)
+                    finish()
+                } catch (_: Throwable) {
+                    recreate()
+                }
+            }
+        }
+        screen.addView(title)
+        screen.addView(details)
+        screen.addView(retry, LinearLayout.LayoutParams(-1, dp(48)))
+        setContentView(screen)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        handler.removeCallbacks(refreshTask)
+        handler.post(refreshTask)
+    }
+
+    override fun onPause() {
+        handler.removeCallbacks(refreshTask)
+        super.onPause()
+    }
+
+    private fun buildUi() {
+        val scroll = ScrollView(this).apply {
+            setBackground(GradientDrawable(
+                GradientDrawable.Orientation.TL_BR,
+                intArrayOf(Color.rgb(7, 13, 28), Color.rgb(15, 31, 49), Color.rgb(18, 20, 38))
+            ))
+            isFillViewport = true
+        }
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(24), dp(20), dp(30))
+        }
+        scroll.addView(root)
+        // Attach the root early: if a later view fails to initialize, the activity won't stay blank.
+        setContentView(scroll)
+
+        val title = TextView(this).apply {
+            text = "BINANCE\nPHONE SCANNER"
+            textSize = 27f
+            typeface = Typeface.create("sans-serif", Typeface.BOLD)
+            setTextColor(Color.rgb(236, 249, 255))
+            letterSpacing = 0.04f
+        }
+        root.addView(title)
+        root.addView(text("USDT PERPETUAL  ·  1H MOMENTUM", 12f, Color.rgb(78, 232, 193), true), margin(0, 5, 0, 18))
+
+        val statusCard = card()
+        statusText = text("상태 확인 중…", 16f, Color.WHITE, true)
+        statusCard.addView(statusText)
+        statusCard.addView(text("검사 시각: 매시간 50분 (한국 시간)", 12f, Color.rgb(174, 194, 211), false), margin(0, 8, 0, 0))
+        progressText = text("검사 진행률 0 / 0 · 0%", 14f, Color.rgb(236, 249, 255), true)
+        statusCard.addView(progressText, margin(0, 14, 0, 7))
+        progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 100
+            progress = 0
+            progressTintList = android.content.res.ColorStateList.valueOf(Color.rgb(34, 197, 145))
+            progressBackgroundTintList = android.content.res.ColorStateList.valueOf(Color.rgb(48, 65, 83))
+            minimumHeight = dp(10)
+        }
+        statusCard.addView(progressBar, LinearLayout.LayoutParams(-1, dp(10)))
+        root.addView(statusCard, margin(0, 0, 0, 12))
+
+        val conditionCard = card()
+        conditionCard.addView(text("감시 조건", 17f, Color.WHITE, true))
+        conditionCard.addView(text(
+            "• 현재 1시간봉 고가가 시가 대비 +5% 이상\n" +
+            "• 현재가가 시가 대비 +4% 이상\n" +
+            "• 현재봉 누적 거래량이 직전 완료봉의 4.5배 이상\n\n" +
+            "※ 미완성 봉 기준이며, 봉 마감 전 조건은 바뀔 수 있습니다.",
+            13f, Color.rgb(197, 214, 229), false
+        ), margin(0, 8, 0, 0))
+        root.addView(conditionCard, margin(0, 0, 0, 12))
+
+        val summaryCard = card()
+        summaryCard.addView(text("최근 검사 요약", 17f, Color.WHITE, true))
+        summaryText = text("아직 검사 기록이 없습니다.", 13f, Color.rgb(197, 214, 229), false)
+        summaryCard.addView(summaryText, margin(0, 8, 0, 0))
+        root.addView(summaryCard, margin(0, 0, 0, 12))
+
+        val controls = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+        }
+        val start = button("감시 시작", Color.rgb(0, 200, 137))
+        start.setOnClickListener {
+            try {
+                val serviceIntent = Intent(this, ScannerService::class.java).apply {
+                    action = ScannerService.ACTION_START
+                }
+                ContextCompat.startForegroundService(this, serviceIntent)
+                statusText.text = "◷ 감시 시작 요청 중…"
+                statusText.setTextColor(Color.rgb(255, 214, 102))
+                Toast.makeText(this, "감시 시작 요청을 보냈습니다. 잠시 후 상태를 확인합니다.", Toast.LENGTH_LONG).show()
+                handler.postDelayed({ safeRefreshData() }, 1000)
+                handler.postDelayed({ safeRefreshData() }, 4000)
+            } catch (e: Exception) {
+                statusText.text = "시작 실패: ${e.message ?: e.javaClass.simpleName}"
+                statusText.setTextColor(Color.RED)
+                Toast.makeText(this, "감시 시작 실패: ${e.message ?: e.javaClass.simpleName}", Toast.LENGTH_LONG).show()
+            }
+        }
+        val stop = button("감시 중지", Color.rgb(68, 82, 105))
+        stop.setOnClickListener {
+            try {
+                val serviceIntent = Intent(this, ScannerService::class.java).apply {
+                    action = ScannerService.ACTION_STOP
+                }
+                ContextCompat.startForegroundService(this, serviceIntent)
+                statusText.text = "◷ 감시 중지 요청 중…"
+                statusText.setTextColor(Color.rgb(255, 214, 102))
+                Toast.makeText(this, "감시 중지 요청을 보냈습니다.", Toast.LENGTH_SHORT).show()
+                handler.postDelayed({ safeRefreshData() }, 1000)
+                handler.postDelayed({ safeRefreshData() }, 4000)
+            } catch (e: Exception) {
+                statusText.text = "중지 요청 실패: ${e.message ?: e.javaClass.simpleName}"
+                statusText.setTextColor(Color.RED)
+                Toast.makeText(this, "중지 요청 실패: ${e.message ?: e.javaClass.simpleName}", Toast.LENGTH_LONG).show()
+            }
+        }
+        controls.addView(start, LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginEnd = dp(8) })
+        controls.addView(stop, LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginStart = dp(8) })
+        root.addView(controls, margin(0, 0, 0, 10))
+
+        val batteryButton = button("백그라운드 유지 설정", Color.rgb(38, 116, 180))
+        batteryButton.setOnClickListener {
+            try {
+                val powerManager = getSystemService(POWER_SERVICE) as PowerManager
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
+                    !powerManager.isIgnoringBatteryOptimizations(packageName)) {
+                    val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                        data = Uri.parse("package:$packageName")
+                    }
+                    startActivity(intent)
+                } else {
+                    startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                }
+            } catch (_: Exception) {
+                try {
+                    startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                } catch (_: Exception) {
+                    Toast.makeText(this, "설정 > 앱 > Binance Phone Scanner > 배터리에서 제한 없음을 선택하세요.", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+        root.addView(batteryButton, margin(0, 0, 0, 20))
+
+        val matchesCard = card()
+        matchesCard.addView(text("감지 종목", 18f, Color.WHITE, true))
+        matchesCard.addView(text("종목을 선택하면 바이낸스 선물 차트로 이동합니다.", 12f, Color.rgb(174, 194, 211), false), margin(0, 5, 0, 10))
+        matchContainer = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        matchesCard.addView(matchContainer)
+        root.addView(matchesCard, margin(0, 0, 0, 12))
+
+        val logCard = card()
+        logCard.addView(text("최근 검사 기록", 18f, Color.WHITE, true))
+        logText = text("아직 검사 기록이 없습니다.", 12f, Color.rgb(190, 208, 224), false).apply {
+            typeface = Typeface.MONOSPACE
+        }
+        logCard.addView(logText, margin(0, 8, 0, 0))
+        root.addView(logCard)
+
+    }
+
+    private fun safeRefreshData() {
+        try {
+            refreshData()
+        } catch (e: Exception) {
+            if (::statusText.isInitialized) {
+                statusText.text = "화면 갱신 오류: ${e.message ?: e.javaClass.simpleName}"
+                statusText.setTextColor(Color.RED)
+            }
+        }
+    }
+
+    private fun refreshData() {
+        val active = prefs.getBoolean("running", false)
+        statusText.text = if (active) "● 감시 실행 중" else "○ 감시 중지 상태"
+        statusText.setTextColor(if (active) Color.rgb(80, 238, 180) else Color.rgb(255, 190, 110))
+
+        val last = prefs.getString("last_scan_time", "없음") ?: "없음"
+        val scanned = prefs.getInt("last_scanned", 0)
+        val matchesCount = prefs.getInt("last_match_count", 0)
+        val failures = prefs.getInt("last_failures", 0)
+        val next = prefs.getString("next_scan", "감시 시작 후 표시") ?: "감시 시작 후 표시"
+        val outcome = prefs.getString("last_outcome", "대기 중") ?: "대기 중"
+        summaryText.text = "최근 검사: $last\n검사 종목: ${scanned}개\n조건 충족: ${matchesCount}개\n요청 실패/시간 초과: ${failures}개\n결과: $outcome\n다음 검사: $next"
+
+        val progressDone = prefs.getInt("scan_progress_done", 0)
+        val progressTotal = prefs.getInt("scan_progress_total", 0)
+        val progressPercent = prefs.getInt("scan_progress_percent", 0).coerceIn(0, 100)
+        val scanning = prefs.getBoolean("scan_in_progress", false)
+        progressText.text = if (progressTotal > 0) {
+            "${if (scanning) "검사 중" else "검사 진행률"}  $progressDone / $progressTotal · $progressPercent%"
+        } else {
+            "검사 진행률 대기 중"
+        }
+        progressBar.progress = progressPercent
+
+        val log = prefs.getString("scan_logs", "") ?: ""
+        val outcomeLine = prefs.getString("last_outcome", "아직 검사 기록이 없습니다.") ?: "아직 검사 기록이 없습니다."
+        val compactLog = log.lines().filter { it.isNotBlank() }.takeLast(3).joinToString("\n")
+        logText.text = if (compactLog.isBlank()) outcomeLine else "$outcomeLine\n$compactLog"
+
+        val matches = try { JSONArray(prefs.getString("last_matches", "[]") ?: "[]") } catch (_: Exception) { JSONArray() }
+        val signature = (0 until matches.length()).joinToString("|") { i ->
+            val m = matches.optJSONObject(i) ?: JSONObject()
+            "${m.optString("symbol")}:${m.optDouble("changePct")}:${m.optDouble("volumeMultiple")}"
+        }
+        if (signature != renderedMatchSignature) {
+            renderedMatchSignature = signature
+            matchContainer.removeAllViews()
+            if (matches.length() == 0) {
+                matchContainer.addView(text("조건 충족 종목 없음 (최근 검사 기준)", 13f, Color.rgb(174, 194, 211), false))
+            } else {
+                for (i in 0 until matches.length()) {
+                    val item = matches.optJSONObject(i) ?: continue
+                    val symbol = item.optString("symbol")
+                    val price = item.optDouble("price")
+                    val highPct = item.optDouble("highPct")
+                    val changePct = item.optDouble("changePct")
+                    val volumeMultiple = item.optDouble("volumeMultiple")
+                    val row = LinearLayout(this).apply {
+                        orientation = LinearLayout.VERTICAL
+                        setPadding(dp(12), dp(12), dp(12), dp(12))
+                        background = rounded(Color.argb(110, 30, 52, 73), dp(14))
+                    }
+                    row.addView(text(symbol, 17f, Color.rgb(91, 235, 194), true))
+                    row.addView(text(
+                        "현재가 ${formatPrice(price)}\n고가/시가 +${"%.2f".format(Locale.US, highPct)}%  ·  현재가/시가 +${"%.2f".format(Locale.US, changePct)}%\n거래량 ${"%.2f".format(Locale.US, volumeMultiple)}배",
+                        12f, Color.rgb(213, 227, 239), false
+                    ), margin(0, 5, 0, 8))
+                    val trade = button("거래하기  ↗", Color.rgb(0, 142, 116))
+                    trade.setOnClickListener { openFuturesChart(symbol) }
+                    row.addView(trade, LinearLayout.LayoutParams(-1, dp(42)))
+                    matchContainer.addView(row, margin(0, 0, 0, 8))
+                }
+            }
+        }
+    }
+
+    private fun openFuturesChart(symbol: String) {
+        val uri = Uri.parse("https://www.binance.com/en/futures/$symbol")
+        try {
+            startActivity(Intent(Intent.ACTION_VIEW, uri))
+        } catch (_: Exception) {
+            Toast.makeText(this, "바이낸스 선물 차트를 열 수 없습니다.", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun card(): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(16), dp(16), dp(16), dp(16))
+        background = rounded(Color.argb(125, 25, 42, 62), dp(20), Color.argb(110, 111, 161, 184))
+    }
+
+    private fun text(value: String, size: Float, color: Int, bold: Boolean): TextView = TextView(this).apply {
+        text = value
+        textSize = size
+        setTextColor(color)
+        if (bold) typeface = Typeface.create("sans-serif", Typeface.BOLD)
+        setLineSpacing(dp(2).toFloat(), 1.02f)
+    }
+
+    private fun button(label: String, color: Int): Button = Button(this).apply {
+        text = label
+        textSize = 14f
+        isAllCaps = false
+        setTextColor(Color.WHITE)
+        background = rounded(color, dp(13))
+        stateListAnimator = null
+    }
+
+    private fun rounded(color: Int, radius: Int, stroke: Int = Color.TRANSPARENT) =
+        GradientDrawable().apply {
+            setColor(color)
+            cornerRadius = radius.toFloat()
+            if (stroke != Color.TRANSPARENT) setStroke(dp(1), stroke)
+        }
+
+    private fun margin(left: Int, top: Int, right: Int, bottom: Int) =
+        LinearLayout.LayoutParams(-1, -2).apply {
+            setMargins(dp(left), dp(top), dp(right), dp(bottom))
+        }
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+
+    private fun formatPrice(value: Double): String =
+        if (value >= 1000) "%,.3f".format(Locale.US, value)
+        else "%.8f".format(Locale.US, value).trimEnd('0').trimEnd('.')
+
+    private fun requestNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 2001)
+        }
+    }
+}
