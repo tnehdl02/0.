@@ -8,6 +8,7 @@ import android.app.Service
 import android.content.Intent
 import android.os.Build
 import android.os.IBinder
+import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import org.json.JSONArray
 import org.json.JSONObject
@@ -43,6 +44,9 @@ class ScannerService : Service() {
     private val running = AtomicBoolean(false)
     private val scheduler = Executors.newSingleThreadExecutor()
     private val scannerPool = Executors.newFixedThreadPool(8)
+    private val progressLock = Any()
+    private var lastProgressDone = 0
+    private var lastNotifyAt = 0L
 
     private val prefs by lazy { getSharedPreferences(PREFS, MODE_PRIVATE) }
 
@@ -148,7 +152,7 @@ class ScannerService : Service() {
 
     private fun performScan() {
         val startText = nowText()
-        appendLog("$startText | 검사 시작 (v1.3) | 바이낸스 USDT 무기한 종목 목록 조회 중")
+        appendLog("$startText | 검사 시작 (v1.4) | 바이낸스 USDT 무기한 종목 목록 조회 중")
         updateServiceNotification("바이낸스 종목 목록 조회 중…")
         prefs.edit().putString("last_outcome", "검사 진행 중").apply()
 
@@ -203,6 +207,10 @@ class ScannerService : Service() {
             .putBoolean("scan_in_progress", true)
             .putString("last_outcome", "검사 진행 중")
             .apply()
+        synchronized(progressLock) {
+            lastProgressDone = 0
+            lastNotifyAt = SystemClock.elapsedRealtime()
+        }
         updateServiceNotification("검사 중 · 0/${symbols.size} · 0%")
 
         val tasks = symbols.map { symbol ->
@@ -212,13 +220,7 @@ class ScannerService : Service() {
                 } finally {
                     val done = completed.incrementAndGet()
                     if (done % progressStep == 0 || done == symbols.size) {
-                        val percent = (done * 100 / symbols.size).coerceIn(0, 100)
-                        prefs.edit()
-                            .putInt("scan_progress_done", done)
-                            .putInt("scan_progress_total", symbols.size)
-                            .putInt("scan_progress_percent", percent)
-                            .apply()
-                        updateServiceNotification("검사 중 · $done/${symbols.size} · $percent%")
+                        publishProgress(done, symbols.size)
                     }
                 }
             }
@@ -294,7 +296,29 @@ class ScannerService : Service() {
         appendLog(logLine)
 
         if (failureCount < symbols.size) matches.forEach { sendMatchNotification(it) }
+        try { Thread.sleep(1000) } catch (_: InterruptedException) {}
         updateServiceNotification("마지막 검사 $endText · ${symbols.size}종목 · 감지 ${matches.size}개 · 실패 $failureCount")
+    }
+
+    // Serialize progress updates from the worker threads. Without this, updates can arrive
+    // out of order (e.g. 85/524 posted after 524/524) and Android may drop notification
+    // updates that are posted too quickly, leaving a stale count in the notification bar.
+    private fun publishProgress(done: Int, total: Int) {
+        synchronized(progressLock) {
+            if (done < lastProgressDone) return
+            lastProgressDone = done
+            val percent = (done * 100 / total).coerceIn(0, 100)
+            prefs.edit()
+                .putInt("scan_progress_done", done)
+                .putInt("scan_progress_total", total)
+                .putInt("scan_progress_percent", percent)
+                .apply()
+            val now = SystemClock.elapsedRealtime()
+            if (now - lastNotifyAt >= 800L && done < total) {
+                lastNotifyAt = now
+                updateServiceNotification("검사 중 · $done/$total · $percent%")
+            }
+        }
     }
 
     private fun getSymbols(): List<String> {
