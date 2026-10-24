@@ -1,6 +1,9 @@
 package com.example.binancephonescanner
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
@@ -34,12 +37,18 @@ class MainActivity : ComponentActivity() {
     private val prefs by lazy { getSharedPreferences(ScannerService.PREFS, MODE_PRIVATE) }
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var statusText: TextView
-    private lateinit var summaryText: TextView
-    private lateinit var logText: TextView
     private lateinit var progressText: TextView
     private lateinit var progressBar: ProgressBar
-    private lateinit var matchContainer: LinearLayout
-    private var renderedMatchSignature = "__NOT_RENDERED__"
+
+    // One section on screen per timeframe (15-minute candle, 1-hour candle).
+    private class Section(val tf: ScanTimeframe) {
+        lateinit var summaryText: TextView
+        lateinit var matchContainer: LinearLayout
+        lateinit var logText: TextView
+        var renderedMatchSignature = "__NOT_RENDERED__"
+    }
+
+    private val sections = ScanTimeframe.values().map { Section(it) }
 
     private val refreshTask = object : Runnable {
         override fun run() {
@@ -132,12 +141,12 @@ class MainActivity : ComponentActivity() {
             letterSpacing = 0.04f
         }
         root.addView(title)
-        root.addView(text("USDT PERPETUAL  ·  1H MOMENTUM", 12f, Color.rgb(78, 232, 193), true), margin(0, 5, 0, 18))
+        root.addView(text("USDT PERPETUAL  ·  15M + 1H MOMENTUM", 12f, Color.rgb(78, 232, 193), true), margin(0, 5, 0, 18))
 
         val statusCard = card()
         statusText = text("상태 확인 중…", 16f, Color.WHITE, true)
         statusCard.addView(statusText)
-        statusCard.addView(text("검사 시각: 매시간 50분 (한국 시간)", 12f, Color.rgb(174, 194, 211), false), margin(0, 8, 0, 0))
+        statusCard.addView(text("검사 시각 (한국 시간)\n• 15분봉: 매시 13 · 28 · 43 · 58분\n• 1시간봉: 매시 50분", 12f, Color.rgb(174, 194, 211), false), margin(0, 8, 0, 0))
         progressText = text("검사 진행률 0 / 0 · 0%", 14f, Color.rgb(236, 249, 255), true)
         statusCard.addView(progressText, margin(0, 14, 0, 7))
         progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
@@ -153,19 +162,14 @@ class MainActivity : ComponentActivity() {
         val conditionCard = card()
         conditionCard.addView(text("감시 조건", 17f, Color.WHITE, true))
         conditionCard.addView(text(
-            "• 현재 1시간봉 고가가 시가 대비 +5% 이상\n" +
+            "15분봉 · 1시간봉 모두 같은 조건입니다.\n\n" +
+            "• 현재 봉의 고가가 시가 대비 +5% 이상\n" +
             "• 현재가가 시가 대비 +4% 이상\n" +
             "• 현재봉 누적 거래량이 직전 완료봉의 4.5배 이상\n\n" +
             "※ 미완성 봉 기준이며, 봉 마감 전 조건은 바뀔 수 있습니다.",
             13f, Color.rgb(197, 214, 229), false
         ), margin(0, 8, 0, 0))
         root.addView(conditionCard, margin(0, 0, 0, 12))
-
-        val summaryCard = card()
-        summaryCard.addView(text("최근 검사 요약", 17f, Color.WHITE, true))
-        summaryText = text("아직 검사 기록이 없습니다.", 13f, Color.rgb(197, 214, 229), false)
-        summaryCard.addView(summaryText, margin(0, 8, 0, 0))
-        root.addView(summaryCard, margin(0, 0, 0, 12))
 
         val controls = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -234,19 +238,27 @@ class MainActivity : ComponentActivity() {
         }
         root.addView(batteryButton, margin(0, 0, 0, 20))
 
-        val matchesCard = card()
-        matchesCard.addView(text("감지 종목", 18f, Color.WHITE, true))
-        matchesCard.addView(text("종목을 선택하면 바이낸스 선물 차트로 이동합니다.", 12f, Color.rgb(174, 194, 211), false), margin(0, 5, 0, 10))
-        matchContainer = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        matchesCard.addView(matchContainer)
-        root.addView(matchesCard, margin(0, 0, 0, 12))
+        for (section in sections) {
+            val sectionCard = card()
+            sectionCard.addView(text("${section.tf.label} 감시", 18f, Color.WHITE, true))
+            section.summaryText = text("아직 검사 기록이 없습니다.", 13f, Color.rgb(197, 214, 229), false)
+            sectionCard.addView(section.summaryText, margin(0, 8, 0, 14))
+            sectionCard.addView(text("감지 종목", 15f, Color.WHITE, true))
+            sectionCard.addView(text("종목명 복사를 누른 뒤 바이낸스 앱 검색창에 붙여넣으세요.", 12f, Color.rgb(174, 194, 211), false), margin(0, 4, 0, 10))
+            section.matchContainer = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+            sectionCard.addView(section.matchContainer)
+            root.addView(sectionCard, margin(0, 0, 0, 12))
+        }
 
         val logCard = card()
         logCard.addView(text("최근 검사 기록", 18f, Color.WHITE, true))
-        logText = text("아직 검사 기록이 없습니다.", 12f, Color.rgb(190, 208, 224), false).apply {
-            typeface = Typeface.MONOSPACE
+        for (section in sections) {
+            logCard.addView(text(section.tf.label, 13f, Color.rgb(91, 235, 194), true), margin(0, 12, 0, 0))
+            section.logText = text("아직 검사 기록이 없습니다.", 12f, Color.rgb(190, 208, 224), false).apply {
+                typeface = Typeface.MONOSPACE
+            }
+            logCard.addView(section.logText, margin(0, 6, 0, 0))
         }
-        logCard.addView(logText, margin(0, 8, 0, 0))
         root.addView(logCard)
 
     }
@@ -267,73 +279,79 @@ class MainActivity : ComponentActivity() {
         statusText.text = if (active) "● 감시 실행 중" else "○ 감시 중지 상태"
         statusText.setTextColor(if (active) Color.rgb(80, 238, 180) else Color.rgb(255, 190, 110))
 
-        val last = prefs.getString("last_scan_time", "없음") ?: "없음"
-        val scanned = prefs.getInt("last_scanned", 0)
-        val matchesCount = prefs.getInt("last_match_count", 0)
-        val failures = prefs.getInt("last_failures", 0)
-        val next = prefs.getString("next_scan", "감시 시작 후 표시") ?: "감시 시작 후 표시"
-        val outcome = prefs.getString("last_outcome", "대기 중") ?: "대기 중"
-        summaryText.text = "최근 검사: $last\n검사 종목: ${scanned}개\n조건 충족: ${matchesCount}개\n요청 실패/시간 초과: ${failures}개\n결과: $outcome\n다음 검사: $next"
-
         val progressDone = prefs.getInt("scan_progress_done", 0)
         val progressTotal = prefs.getInt("scan_progress_total", 0)
         val progressPercent = prefs.getInt("scan_progress_percent", 0).coerceIn(0, 100)
         val scanning = prefs.getBoolean("scan_in_progress", false)
+        val scanLabel = prefs.getString("scan_label", "") ?: ""
+        val labelPrefix = if (scanLabel.isBlank()) "" else "[$scanLabel] "
         progressText.text = if (progressTotal > 0) {
-            "${if (scanning) "검사 중" else "검사 진행률"}  $progressDone / $progressTotal · $progressPercent%"
+            "$labelPrefix${if (scanning) "검사 중" else "검사 진행률"}  $progressDone / $progressTotal · $progressPercent%"
         } else {
             "검사 진행률 대기 중"
         }
         progressBar.progress = progressPercent
 
-        val log = prefs.getString("scan_logs", "") ?: ""
-        val outcomeLine = prefs.getString("last_outcome", "아직 검사 기록이 없습니다.") ?: "아직 검사 기록이 없습니다."
-        val compactLog = log.lines().filter { it.isNotBlank() }.takeLast(3).joinToString("\n")
-        logText.text = if (compactLog.isBlank()) outcomeLine else "$outcomeLine\n$compactLog"
+        for (section in sections) refreshSection(section)
+    }
 
-        val matches = try { JSONArray(prefs.getString("last_matches", "[]") ?: "[]") } catch (_: Exception) { JSONArray() }
+    private fun refreshSection(section: Section) {
+        val tf = section.tf
+        val last = prefs.getString(tf.key("last_scan_time"), "없음") ?: "없음"
+        val scanned = prefs.getInt(tf.key("last_scanned"), 0)
+        val matchesCount = prefs.getInt(tf.key("last_match_count"), 0)
+        val failures = prefs.getInt(tf.key("last_failures"), 0)
+        val next = prefs.getString(tf.key("next_scan"), "감시 시작 후 표시") ?: "감시 시작 후 표시"
+        val outcome = prefs.getString(tf.key("last_outcome"), "대기 중") ?: "대기 중"
+        section.summaryText.text = "최근 검사: $last\n검사 종목: ${scanned}개\n조건 충족: ${matchesCount}개\n요청 실패/시간 초과: ${failures}개\n결과: $outcome\n다음 검사: $next"
+
+        val log = prefs.getString(tf.key("scan_logs"), "") ?: ""
+        val compactLog = log.lines().filter { it.isNotBlank() }.takeLast(3).joinToString("\n")
+        section.logText.text = if (compactLog.isBlank()) outcome else "$outcome\n$compactLog"
+
+        val matches = try { JSONArray(prefs.getString(tf.key("last_matches"), "[]") ?: "[]") } catch (_: Exception) { JSONArray() }
         val signature = (0 until matches.length()).joinToString("|") { i ->
             val m = matches.optJSONObject(i) ?: JSONObject()
             "${m.optString("symbol")}:${m.optDouble("changePct")}:${m.optDouble("volumeMultiple")}"
         }
-        if (signature != renderedMatchSignature) {
-            renderedMatchSignature = signature
-            matchContainer.removeAllViews()
-            if (matches.length() == 0) {
-                matchContainer.addView(text("조건 충족 종목 없음 (최근 검사 기준)", 13f, Color.rgb(174, 194, 211), false))
-            } else {
-                for (i in 0 until matches.length()) {
-                    val item = matches.optJSONObject(i) ?: continue
-                    val symbol = item.optString("symbol")
-                    val price = item.optDouble("price")
-                    val highPct = item.optDouble("highPct")
-                    val changePct = item.optDouble("changePct")
-                    val volumeMultiple = item.optDouble("volumeMultiple")
-                    val row = LinearLayout(this).apply {
-                        orientation = LinearLayout.VERTICAL
-                        setPadding(dp(12), dp(12), dp(12), dp(12))
-                        background = rounded(Color.argb(110, 30, 52, 73), dp(14))
-                    }
-                    row.addView(text(symbol, 17f, Color.rgb(91, 235, 194), true))
-                    row.addView(text(
-                        "현재가 ${formatPrice(price)}\n고가/시가 +${"%.2f".format(Locale.US, highPct)}%  ·  현재가/시가 +${"%.2f".format(Locale.US, changePct)}%\n거래량 ${"%.2f".format(Locale.US, volumeMultiple)}배",
-                        12f, Color.rgb(213, 227, 239), false
-                    ), margin(0, 5, 0, 8))
-                    val trade = button("거래하기  ↗", Color.rgb(0, 142, 116))
-                    trade.setOnClickListener { openFuturesChart(symbol) }
-                    row.addView(trade, LinearLayout.LayoutParams(-1, dp(42)))
-                    matchContainer.addView(row, margin(0, 0, 0, 8))
-                }
+        if (signature == section.renderedMatchSignature) return
+        section.renderedMatchSignature = signature
+        section.matchContainer.removeAllViews()
+        if (matches.length() == 0) {
+            section.matchContainer.addView(text("조건 충족 종목 없음 (최근 검사 기준)", 13f, Color.rgb(174, 194, 211), false))
+            return
+        }
+        for (i in 0 until matches.length()) {
+            val item = matches.optJSONObject(i) ?: continue
+            val symbol = item.optString("symbol")
+            val price = item.optDouble("price")
+            val highPct = item.optDouble("highPct")
+            val changePct = item.optDouble("changePct")
+            val volumeMultiple = item.optDouble("volumeMultiple")
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(12), dp(12), dp(12), dp(12))
+                background = rounded(Color.argb(110, 30, 52, 73), dp(14))
             }
+            row.addView(text(symbol, 17f, Color.rgb(91, 235, 194), true))
+            row.addView(text(
+                "현재가 ${formatPrice(price)}\n고가/시가 +${"%.2f".format(Locale.US, highPct)}%  ·  현재가/시가 +${"%.2f".format(Locale.US, changePct)}%\n거래량 ${"%.2f".format(Locale.US, volumeMultiple)}배",
+                12f, Color.rgb(213, 227, 239), false
+            ), margin(0, 5, 0, 8))
+            val copy = button("종목명 복사", Color.rgb(0, 142, 116))
+            copy.setOnClickListener { copySymbol(symbol) }
+            row.addView(copy, LinearLayout.LayoutParams(-1, dp(42)))
+            section.matchContainer.addView(row, margin(0, 0, 0, 8))
         }
     }
 
-    private fun openFuturesChart(symbol: String) {
-        val uri = Uri.parse("https://www.binance.com/en/futures/$symbol")
+    private fun copySymbol(symbol: String) {
         try {
-            startActivity(Intent(Intent.ACTION_VIEW, uri))
+            val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            clipboard.setPrimaryClip(ClipData.newPlainText("symbol", symbol))
+            Toast.makeText(this, "$symbol 복사됨", Toast.LENGTH_SHORT).show()
         } catch (_: Exception) {
-            Toast.makeText(this, "바이낸스 선물 차트를 열 수 없습니다.", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "복사하지 못했습니다.", Toast.LENGTH_SHORT).show()
         }
     }
 
