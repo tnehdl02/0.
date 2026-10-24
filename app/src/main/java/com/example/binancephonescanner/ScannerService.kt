@@ -611,9 +611,8 @@ class ScannerService : Service() {
     }
 
     /**
-     * Posts one standalone notification for a detected coin. Each alert has a unique id and its
-     * own unique group key, so Android does not stack the alerts under the status notification
-     * or bundle them together.
+     * Posts one standalone notification for a detected coin. Each alert has a unique id and
+     * independent title ("15분봉 급등 종목 알림" / "1시간봉 급등 종목 알림"), so Android does not bundle them.
      */
     private fun sendMatchNotification(tf: ScanTimeframe, match: Match) {
         val manager = getSystemService(NotificationManager::class.java)
@@ -629,14 +628,17 @@ class ScannerService : Service() {
         val body = "고가/시가 +%.2f%% · 현재/시가 +%.2f%% · 거래량 %.2fx".format(
             Locale.US, match.highPct, match.changePct, match.volumeMultiple
         )
+        
+        // 요청하신 대로 "15분봉 급등 종목 알림" 또는 "1시간봉 급등 종목 알림" 형태로 개별 제목 지정
+        val alertTitle = "${tf.label} 급등 종목 알림: ${match.symbol}"
+
         val notification = NotificationCompat.Builder(this, CHANNEL_ALERTS)
             .setSmallIcon(android.R.drawable.ic_dialog_info)
-            .setContentTitle("[${tf.label}] 급등 감지: ${match.symbol}")
+            .setContentTitle(alertTitle)
             .setContentText(body)
             .setStyle(NotificationCompat.BigTextStyle().bigText("$body\n현재가 ${match.price}"))
             .setContentIntent(openPending)
             .addAction(0, "종목명 복사", copyPending)
-            .setGroup("surge_alert_$id")
             .setAutoCancel(true)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .build()
