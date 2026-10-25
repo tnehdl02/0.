@@ -42,9 +42,10 @@ class MainActivity : ComponentActivity() {
 
     // One section on screen per timeframe (15-minute candle, 1-hour candle).
     private class Section(val tf: ScanTimeframe) {
+        lateinit var stateText: TextView
+        lateinit var toggleButton: Button
         lateinit var summaryText: TextView
         lateinit var matchContainer: LinearLayout
-        lateinit var logText: TextView
         var renderedMatchSignature = "__NOT_RENDERED__"
     }
 
@@ -161,59 +162,14 @@ class MainActivity : ComponentActivity() {
 
         val conditionCard = card()
         conditionCard.addView(text("감시 조건", 17f, Color.WHITE, true))
-        conditionCard.addView(text(
-            "15분봉 · 1시간봉 모두 같은 조건입니다.\n\n" +
-            "• 현재 봉의 고가가 시가 대비 +5% 이상\n" +
-            "• 현재가가 시가 대비 +4% 이상\n" +
-            "• 현재봉 누적 거래량이 직전 완료봉의 4.5배 이상\n\n" +
-            "※ 미완성 봉 기준이며, 봉 마감 전 조건은 바뀔 수 있습니다.",
-            13f, Color.rgb(197, 214, 229), false
-        ), margin(0, 8, 0, 0))
+        val conditionText = ScanTimeframe.values().joinToString("\n\n") { tf ->
+            "[${tf.label}]\n" +
+            "• 현재 봉의 고가가 시가 대비 +${fmtPct(tf.highPct)}% 이상\n" +
+            "• 현재가가 시가 대비 +${fmtPct(tf.livePct)}% 이상\n" +
+            "• 현재봉 누적 거래량이 직전 완료봉의 ${fmtPct(tf.volumeMultiple)}배 이상"
+        } + "\n\n※ 미완성 봉 기준이며, 봉 마감 전 조건은 바뀔 수 있습니다."
+        conditionCard.addView(text(conditionText, 13f, Color.rgb(197, 214, 229), false), margin(0, 8, 0, 0))
         root.addView(conditionCard, margin(0, 0, 0, 12))
-
-        val controls = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-        }
-        val start = button("감시 시작", Color.rgb(0, 200, 137))
-        start.setOnClickListener {
-            try {
-                val serviceIntent = Intent(this, ScannerService::class.java).apply {
-                    action = ScannerService.ACTION_START
-                }
-                ContextCompat.startForegroundService(this, serviceIntent)
-                statusText.text = "◷ 감시 시작 요청 중…"
-                statusText.setTextColor(Color.rgb(255, 214, 102))
-                Toast.makeText(this, "감시 시작 요청을 보냈습니다. 잠시 후 상태를 확인합니다.", Toast.LENGTH_LONG).show()
-                handler.postDelayed({ safeRefreshData() }, 1000)
-                handler.postDelayed({ safeRefreshData() }, 4000)
-            } catch (e: Exception) {
-                statusText.text = "시작 실패: ${e.message ?: e.javaClass.simpleName}"
-                statusText.setTextColor(Color.RED)
-                Toast.makeText(this, "감시 시작 실패: ${e.message ?: e.javaClass.simpleName}", Toast.LENGTH_LONG).show()
-            }
-        }
-        val stop = button("감시 중지", Color.rgb(68, 82, 105))
-        stop.setOnClickListener {
-            try {
-                val serviceIntent = Intent(this, ScannerService::class.java).apply {
-                    action = ScannerService.ACTION_STOP
-                }
-                ContextCompat.startForegroundService(this, serviceIntent)
-                statusText.text = "◷ 감시 중지 요청 중…"
-                statusText.setTextColor(Color.rgb(255, 214, 102))
-                Toast.makeText(this, "감시 중지 요청을 보냈습니다.", Toast.LENGTH_SHORT).show()
-                handler.postDelayed({ safeRefreshData() }, 1000)
-                handler.postDelayed({ safeRefreshData() }, 4000)
-            } catch (e: Exception) {
-                statusText.text = "중지 요청 실패: ${e.message ?: e.javaClass.simpleName}"
-                statusText.setTextColor(Color.RED)
-                Toast.makeText(this, "중지 요청 실패: ${e.message ?: e.javaClass.simpleName}", Toast.LENGTH_LONG).show()
-            }
-        }
-        controls.addView(start, LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginEnd = dp(8) })
-        controls.addView(stop, LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginStart = dp(8) })
-        root.addView(controls, margin(0, 0, 0, 10))
 
         val batteryButton = button("백그라운드 유지 설정", Color.rgb(38, 116, 180))
         batteryButton.setOnClickListener {
@@ -236,31 +192,57 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
-        root.addView(batteryButton, margin(0, 0, 0, 20))
+        root.addView(batteryButton, margin(0, 0, 0, 16))
 
         for (section in sections) {
+            val tf = section.tf
             val sectionCard = card()
-            sectionCard.addView(text("${section.tf.label} 감시", 18f, Color.WHITE, true))
+            sectionCard.addView(text("${tf.label} 감시", 18f, Color.WHITE, true))
+            section.stateText = text("○ 꺼짐", 14f, Color.rgb(255, 190, 110), true)
+            sectionCard.addView(section.stateText, margin(0, 6, 0, 10))
+
+            val buttons = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            section.toggleButton = button("${tf.label} 감시 시작", Color.rgb(0, 200, 137))
+            section.toggleButton.setOnClickListener { toggleTimeframe(section) }
+            val history = button("기록 확인", Color.rgb(38, 116, 180))
+            history.setOnClickListener {
+                startActivity(Intent(this, HistoryActivity::class.java).apply {
+                    putExtra(ScannerService.EXTRA_TIMEFRAME, tf.id)
+                })
+            }
+            buttons.addView(section.toggleButton, LinearLayout.LayoutParams(0, dp(46), 3f))
+            buttons.addView(history, LinearLayout.LayoutParams(0, dp(46), 2f).apply { marginStart = dp(8) })
+            sectionCard.addView(buttons, margin(0, 0, 0, 12))
+
             section.summaryText = text("아직 검사 기록이 없습니다.", 13f, Color.rgb(197, 214, 229), false)
-            sectionCard.addView(section.summaryText, margin(0, 8, 0, 14))
+            sectionCard.addView(section.summaryText, margin(0, 0, 0, 14))
             sectionCard.addView(text("감지 종목", 15f, Color.WHITE, true))
             sectionCard.addView(text("종목명 복사를 누른 뒤 바이낸스 앱 검색창에 붙여넣으세요.", 12f, Color.rgb(174, 194, 211), false), margin(0, 4, 0, 10))
             section.matchContainer = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
             sectionCard.addView(section.matchContainer)
             root.addView(sectionCard, margin(0, 0, 0, 12))
         }
+    }
 
-        val logCard = card()
-        logCard.addView(text("최근 검사 기록", 18f, Color.WHITE, true))
-        for (section in sections) {
-            logCard.addView(text(section.tf.label, 13f, Color.rgb(91, 235, 194), true), margin(0, 12, 0, 0))
-            section.logText = text("아직 검사 기록이 없습니다.", 12f, Color.rgb(190, 208, 224), false).apply {
-                typeface = Typeface.MONOSPACE
+    /** Switches one timeframe on or off without touching the other one. */
+    private fun toggleTimeframe(section: Section) {
+        val tf = section.tf
+        val enabled = prefs.getBoolean(tf.key("enabled"), false)
+        try {
+            val serviceIntent = Intent(this, ScannerService::class.java).apply {
+                action = if (enabled) ScannerService.ACTION_STOP else ScannerService.ACTION_START
+                putExtra(ScannerService.EXTRA_TIMEFRAME, tf.id)
             }
-            logCard.addView(section.logText, margin(0, 6, 0, 0))
+            ContextCompat.startForegroundService(this, serviceIntent)
+            section.stateText.text = if (enabled) "◷ 중지 요청 중…" else "◷ 시작 요청 중…"
+            section.stateText.setTextColor(Color.rgb(255, 214, 102))
+            handler.postDelayed({ safeRefreshData() }, 1000)
+            handler.postDelayed({ safeRefreshData() }, 4000)
+        } catch (e: Exception) {
+            section.stateText.text = "요청 실패: ${e.message ?: e.javaClass.simpleName}"
+            section.stateText.setTextColor(Color.RED)
+            Toast.makeText(this, "${tf.label} 요청 실패: ${e.message ?: e.javaClass.simpleName}", Toast.LENGTH_LONG).show()
         }
-        root.addView(logCard)
-
     }
 
     private fun safeRefreshData() {
@@ -275,8 +257,9 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun refreshData() {
-        val active = prefs.getBoolean("running", false)
-        statusText.text = if (active) "● 감시 실행 중" else "○ 감시 중지 상태"
+        val activeLabels = ScanTimeframe.values().filter { prefs.getBoolean(it.key("enabled"), false) }
+        val active = activeLabels.isNotEmpty()
+        statusText.text = if (active) "● 감시 실행 중 (${activeLabels.joinToString(" · ") { it.label }})" else "○ 감시 꺼짐"
         statusText.setTextColor(if (active) Color.rgb(80, 238, 180) else Color.rgb(255, 190, 110))
 
         val progressDone = prefs.getInt("scan_progress_done", 0)
@@ -305,9 +288,11 @@ class MainActivity : ComponentActivity() {
         val outcome = prefs.getString(tf.key("last_outcome"), "대기 중") ?: "대기 중"
         section.summaryText.text = "최근 검사: $last\n검사 종목: ${scanned}개\n조건 충족: ${matchesCount}개\n요청 실패/시간 초과: ${failures}개\n결과: $outcome\n다음 검사: $next"
 
-        val log = prefs.getString(tf.key("scan_logs"), "") ?: ""
-        val compactLog = log.lines().filter { it.isNotBlank() }.takeLast(3).joinToString("\n")
-        section.logText.text = if (compactLog.isBlank()) outcome else "$outcome\n$compactLog"
+        val enabled = prefs.getBoolean(tf.key("enabled"), false)
+        section.stateText.text = if (enabled) "● 실행 중" else "○ 꺼짐"
+        section.stateText.setTextColor(if (enabled) Color.rgb(80, 238, 180) else Color.rgb(255, 190, 110))
+        section.toggleButton.text = if (enabled) "${tf.label} 감시 중지" else "${tf.label} 감시 시작"
+        section.toggleButton.background = rounded(if (enabled) Color.rgb(68, 82, 105) else Color.rgb(0, 200, 137), dp(13))
 
         val matches = try { JSONArray(prefs.getString(tf.key("last_matches"), "[]") ?: "[]") } catch (_: Exception) { JSONArray() }
         val signature = (0 until matches.length()).joinToString("|") { i ->
@@ -344,6 +329,9 @@ class MainActivity : ComponentActivity() {
             section.matchContainer.addView(row, margin(0, 0, 0, 8))
         }
     }
+
+    private fun fmtPct(value: Double): String =
+        if (value % 1.0 == 0.0) value.toInt().toString() else value.toString()
 
     private fun copySymbol(symbol: String) {
         try {

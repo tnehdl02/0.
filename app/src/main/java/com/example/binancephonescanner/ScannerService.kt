@@ -62,7 +62,7 @@ class ScannerService : Service() {
         const val ACTION_START = "com.example.binancephonescanner.START"
         const val ACTION_STOP = "com.example.binancephonescanner.STOP"
         const val ACTION_SCAN = "com.example.binancephonescanner.SCAN"
-        private const val EXTRA_TIMEFRAME = "timeframe"
+        const val EXTRA_TIMEFRAME = "timeframe"
         private const val ALARM_REQUEST_BASE = 2000
         const val PREFS = "binance_scanner_state"
         private const val CHANNEL_SERVICE = "scanner_status"
@@ -73,7 +73,6 @@ class ScannerService : Service() {
         private val SHORT_TIME: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm", Locale.KOREA)
     }
 
-    private val running = AtomicBoolean(false)
     private val scheduler = Executors.newSingleThreadExecutor()
     private val scannerPool = Executors.newFixedThreadPool(8)
     private val progressLock = Any()
@@ -92,83 +91,107 @@ class ScannerService : Service() {
         startForeground(SERVICE_NOTIFICATION_ID, serviceNotification("감시 서비스 준비 중"))
     }
 
+    private fun isEnabled(tf: ScanTimeframe): Boolean = prefs.getBoolean(tf.key("enabled"), false)
+
+    private fun enabledTimeframes(): List<ScanTimeframe> = ScanTimeframe.values().filter { isEnabled(it) }
+
+    /** "running" stays true while at least one timeframe is switched on (used by RestartReceiver). */
+    private fun syncRunningFlag() {
+        prefs.edit().putBoolean("running", enabledTimeframes().isNotEmpty()).apply()
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val requested = ScanTimeframe.values().firstOrNull { it.id == intent?.getStringExtra(EXTRA_TIMEFRAME) }
         when (intent?.action) {
             ACTION_STOP -> {
-                stopMonitoring()
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                stopSelf()
-                return START_NOT_STICKY
+                // With a timeframe: switch only that one off. Without: switch everything off.
+                if (requested != null) disableTimeframe(requested)
+                else ScanTimeframe.values().forEach { disableTimeframe(it) }
             }
-            ACTION_SCAN -> {
-                val tf = ScanTimeframe.values().firstOrNull { it.id == intent?.getStringExtra(EXTRA_TIMEFRAME) }
-                if (tf == null || !handleScanAlarm(tf)) {
-                    // Monitoring was stopped by the user, so a leftover alarm must not restart it.
-                    stopForeground(STOP_FOREGROUND_REMOVE)
-                    stopSelf()
-                    return START_NOT_STICKY
-                }
-            }
-            ACTION_START, null -> startMonitoring()
+            ACTION_SCAN -> if (requested != null) handleScanAlarm(requested)
+            ACTION_START -> if (requested != null) enableTimeframe(requested) else resumeMonitoring()
+            // No action: the system restarted the service (or boot/update receiver).
+            else -> resumeMonitoring()
+        }
+        if (enabledTimeframes().isEmpty()) {
+            syncRunningFlag()
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return START_NOT_STICKY
         }
         return START_STICKY
     }
 
-    private fun startMonitoring() {
-        if (!running.compareAndSet(false, true)) {
-            scheduleAllAlarms(afterFire = false)
-            updateServiceNotification(idleText())
-            return
-        }
-        prefs.edit().putBoolean("running", true).apply()
-        // The hourly/15-minute scans are triggered by AlarmManager alarms, which wake the phone
-        // even in Doze mode. (Thread.sleep() stops counting while the CPU sleeps.)
-        scheduleAllAlarms(afterFire = false)
+    /** Switches one timeframe on: schedules its alarms and runs one scan right away. */
+    private fun enableTimeframe(tf: ScanTimeframe) {
+        val alreadyEnabled = isEnabled(tf)
+        prefs.edit().putBoolean(tf.key("enabled"), true).apply()
+        syncRunningFlag()
+        scheduleAlarm(tf, afterFire = false)
         refreshNextScanPrefs()
         updateServiceNotification(idleText())
+        if (alreadyEnabled) return
+
         val wakeLock = acquireWakeLock()
         try {
             scheduler.execute {
                 try {
-                    // Run each timeframe once immediately so the user can verify that scanning works.
-                    for (tf in ScanTimeframe.values()) {
-                        if (!running.get()) break
-                        appendLog(tf, "${nowText()} | 감시 시작 | 즉시 검사 시작")
-                        try {
-                            performScan(tf)
-                        } catch (e: Exception) {
-                            val message = "첫 검사 오류: ${e.message ?: e.javaClass.simpleName}"
-                            appendLog(tf, "${nowText()} | 검사 실패 | $message")
-                            prefs.edit().putString(tf.key("last_outcome"), "검사 실패").apply()
-                            updateServiceNotification("검사 오류 · 인터넷 연결을 확인하세요")
-                        }
-                    }
+                    appendLog(tf, "${nowText()} | 감시 시작 | 즉시 검사 시작")
+                    performScan(tf)
+                } catch (e: Exception) {
+                    val message = "첫 검사 오류: ${e.message ?: e.javaClass.simpleName}"
+                    appendLog(tf, "${nowText()} | 검사 실패 | $message")
+                    prefs.edit()
+                        .putString(tf.key("last_outcome"), "검사 실패")
+                        .putBoolean("scan_in_progress", false)
+                        .apply()
+                    updateServiceNotification("[${tf.label}] 검사 오류 · 인터넷 연결을 확인하세요")
                 } finally {
                     releaseWakeLock(wakeLock)
-                    if (running.get()) updateServiceNotification(idleText())
+                    updateServiceNotification(idleText())
                 }
             }
         } catch (e: Exception) {
             releaseWakeLock(wakeLock)
-            running.set(false)
-            cancelAlarms()
-            prefs.edit().putBoolean("running", false).putString("scan_label", "").apply()
-            ScanTimeframe.values().forEach { tf ->
-                prefs.edit().putString(tf.key("last_outcome"), "감시 시작 실패: ${e.message ?: e.javaClass.simpleName}").apply()
-                appendLog(tf, "${nowText()} | 감시 시작 실패 | ${e.message ?: e.javaClass.simpleName}")
-            }
-            updateServiceNotification("감시 시작 실패 · 앱을 다시 실행하세요")
+            cancelAlarm(tf)
+            val reason = e.message ?: e.javaClass.simpleName
+            prefs.edit()
+                .putBoolean(tf.key("enabled"), false)
+                .putString(tf.key("last_outcome"), "감시 시작 실패: $reason")
+                .apply()
+            syncRunningFlag()
+            appendLog(tf, "${nowText()} | 감시 시작 실패 | $reason")
+            refreshNextScanPrefs()
         }
     }
 
+    /** Switches one timeframe off. The service itself stops when no timeframe is left. */
+    private fun disableTimeframe(tf: ScanTimeframe) {
+        cancelAlarm(tf)
+        val editor = prefs.edit()
+            .putBoolean(tf.key("enabled"), false)
+            .putString(tf.key("next_scan"), "감시 중지")
+        if (prefs.getString("scan_label", "") == tf.label) editor.putBoolean("scan_in_progress", false)
+        editor.apply()
+        syncRunningFlag()
+        updateServiceNotification(idleText())
+    }
+
+    /** After a system restart, re-arm the alarms of every timeframe that was switched on. */
+    private fun resumeMonitoring() {
+        enabledTimeframes().forEach { scheduleAlarm(it, afterFire = false) }
+        syncRunningFlag()
+        refreshNextScanPrefs()
+        updateServiceNotification(idleText())
+    }
+
     /**
-     * Called when an alarm fires. Returns false if monitoring was stopped (nothing to do).
-     * The next alarm for this timeframe is scheduled first, so the chain never breaks even if
-     * the scan itself fails.
+     * Called when an alarm fires. The next alarm for this timeframe is scheduled first, so the
+     * chain never breaks even if the scan itself fails. A stale alarm of a switched-off
+     * timeframe is ignored.
      */
-    private fun handleScanAlarm(tf: ScanTimeframe): Boolean {
-        if (!prefs.getBoolean("running", false)) return false
-        running.set(true)
+    private fun handleScanAlarm(tf: ScanTimeframe) {
+        if (!isEnabled(tf)) return
         scheduleAlarm(tf, afterFire = true)
         refreshNextScanPrefs()
         val wakeLock = acquireWakeLock()
@@ -179,18 +202,20 @@ class ScannerService : Service() {
                 } catch (e: Exception) {
                     val message = "검사 오류: ${e.message ?: e.javaClass.simpleName}"
                     appendLog(tf, "${nowText()} | 검사 실패 | $message")
-                    prefs.edit().putString(tf.key("last_outcome"), "검사 실패").apply()
+                    prefs.edit()
+                        .putString(tf.key("last_outcome"), "검사 실패")
+                        .putBoolean("scan_in_progress", false)
+                        .apply()
                     updateServiceNotification("[${tf.label}] 검사 오류 · 인터넷 연결을 확인하세요")
                 } finally {
                     releaseWakeLock(wakeLock)
-                    if (running.get()) updateServiceNotification(idleText())
+                    updateServiceNotification(idleText())
                 }
             }
         } catch (e: Exception) {
             releaseWakeLock(wakeLock)
             appendLog(tf, "${nowText()} | 실패 | 검사 예약 실행 오류: ${e.message ?: e.javaClass.simpleName}")
         }
-        return true
     }
 
     // ---- Alarms & wake lock ---------------------------------------------------------------
@@ -204,10 +229,6 @@ class ScannerService : Service() {
             this, ALARM_REQUEST_BASE + tf.ordinal, intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
-    }
-
-    private fun scheduleAllAlarms(afterFire: Boolean) {
-        ScanTimeframe.values().forEach { scheduleAlarm(it, afterFire) }
     }
 
     private fun scheduleAlarm(tf: ScanTimeframe, afterFire: Boolean) {
@@ -228,10 +249,9 @@ class ScannerService : Service() {
         }
     }
 
-    private fun cancelAlarms() {
+    private fun cancelAlarm(tf: ScanTimeframe) {
         try {
-            val alarmManager = getSystemService(AlarmManager::class.java)
-            ScanTimeframe.values().forEach { alarmManager.cancel(alarmPendingIntent(it)) }
+            getSystemService(AlarmManager::class.java).cancel(alarmPendingIntent(tf))
         } catch (_: Exception) {
         }
     }
@@ -254,15 +274,6 @@ class ScannerService : Service() {
         }
     }
 
-    private fun stopMonitoring() {
-        running.set(false)
-        cancelAlarms()
-        val editor = prefs.edit().putBoolean("running", false)
-        ScanTimeframe.values().forEach { editor.putString(it.key("next_scan"), "감시 중지") }
-        editor.apply()
-        scheduler.shutdownNow()
-    }
-
     // ---- Schedule -------------------------------------------------------------------------
 
     private fun nextTarget(tf: ScanTimeframe, now: ZonedDateTime = ZonedDateTime.now(KST)): ZonedDateTime {
@@ -276,27 +287,30 @@ class ScannerService : Service() {
         return hourStart.plusHours(2).withMinute(tf.scanMinutes.first()).withSecond(5).withNano(0)
     }
 
-    /** The timeframe whose scan time comes first, and when. */
-    private fun nextScheduled(): Pair<ScanTimeframe, ZonedDateTime> {
+    /** Among the timeframes that are switched on: which scan comes first, and when. Null if none. */
+    private fun nextScheduled(): Pair<ScanTimeframe, ZonedDateTime>? {
         val now = ZonedDateTime.now(KST)
-        return ScanTimeframe.values()
+        return enabledTimeframes()
             .map { it to nextTarget(it, now) }
-            .minByOrNull { it.second.toInstant().toEpochMilli() }!!
+            .minByOrNull { it.second.toInstant().toEpochMilli() }
     }
 
     private fun nextScanText(tf: ScanTimeframe): String = nextTarget(tf).format(DISPLAY_TIME) + " KST"
 
     private fun refreshNextScanPrefs() {
         val editor = prefs.edit()
-        ScanTimeframe.values().forEach { editor.putString(it.key("next_scan"), nextScanText(it)) }
+        ScanTimeframe.values().forEach {
+            editor.putString(it.key("next_scan"), if (isEnabled(it)) nextScanText(it) else "감시 중지")
+        }
         editor.apply()
     }
 
     /** Text for the ongoing notification while waiting for the next scan. */
     private fun idleText(): String {
-        val (tf, target) = nextScheduled()
+        val (tf, target) = nextScheduled() ?: return "감시 꺼짐"
         val next = "다음 ${tf.label} ${target.format(SHORT_TIME)}"
-        return if (lastStatusLine.isBlank()) "감시 실행 중 · $next" else "$lastStatusLine · $next"
+        val labels = enabledTimeframes().joinToString("·") { it.label }
+        return if (lastStatusLine.isBlank()) "감시 실행 중($labels) · $next" else "$lastStatusLine · $next"
     }
 
     private fun nowText(): String = ZonedDateTime.now(KST).format(DISPLAY_TIME)
@@ -306,7 +320,10 @@ class ScannerService : Service() {
         val price: Double,
         val highPct: Double,
         val changePct: Double,
-        val volumeMultiple: Double
+        val volumeMultiple: Double,
+        val lowPrice: Double,
+        val highPrice: Double,
+        val observedAt: Long
     )
 
     // ---- Scan -----------------------------------------------------------------------------
@@ -314,7 +331,7 @@ class ScannerService : Service() {
     private fun performScan(tf: ScanTimeframe) {
         val startText = nowText()
         val tag = "[${tf.label}]"
-        appendLog(tf, "$startText | 검사 시작 (v1.7) | 바이낸스 USDT 무기한 종목 목록 조회 중")
+        appendLog(tf, "$startText | 검사 시작 (v1.9) | 바이낸스 USDT 무기한 종목 목록 조회 중")
         updateServiceNotification("$tag 종목 목록 조회 중…")
         prefs.edit()
             .putString(tf.key("last_outcome"), "검사 진행 중")
@@ -409,6 +426,15 @@ class ScannerService : Service() {
             failures.incrementAndGet()
         }
 
+        if (!isEnabled(tf)) {
+            // The user switched this timeframe off while the scan was running: drop the results.
+            prefs.edit()
+                .putBoolean("scan_in_progress", false)
+                .putString(tf.key("last_outcome"), "감시 중지됨")
+                .apply()
+            return
+        }
+
         matches.sortByDescending { it.changePct }
         val endText = nowText()
         val matchJson = JSONArray()
@@ -461,8 +487,43 @@ class ScannerService : Service() {
         }
         appendLog(tf, logLine)
 
+        // Keep the result for 5 days so the history screen can compare symbols over time.
+        if (failureCount < symbols.size) {
+            try {
+                ScanHistory.append(
+                    this, tf,
+                    ScanHistory.ScanRecord(
+                        System.currentTimeMillis(), symbols.size, failureCount,
+                        matches.map {
+                            ScanHistory.MatchRecord(
+                                symbol = it.symbol,
+                                price = it.price,
+                                highPct = it.highPct,
+                                changePct = it.changePct,
+                                volumeMultiple = it.volumeMultiple,
+                                lowPrice = it.lowPrice,
+                                highAtDetection = it.highPrice,
+                                observedAt = it.observedAt,
+                                peakPrice = it.price,
+                                peakTime = it.observedAt,
+                                peakBeforeStop = it.price
+                            )
+                        }
+                    )
+                )
+            } catch (_: Exception) {
+            }
+        }
+
         // One separate notification per detected coin.
         if (failureCount < symbols.size) matches.forEach { sendMatchNotification(tf, it) }
+        // Follow up on earlier detections (stop-loss / 5-day peak). Alerts above go out first.
+        updateServiceNotification("$tag 감지 종목 추적 결과 갱신 중…")
+        try {
+            HistoryTracker.update(this, tf)
+        } catch (e: Exception) {
+            appendLog(tf, "${nowText()} | 추적 갱신 실패 | ${e.message ?: e.javaClass.simpleName}")
+        }
         try { Thread.sleep(1000) } catch (_: InterruptedException) {}
         lastStatusLine = "$tag ${ZonedDateTime.now(KST).format(SHORT_TIME)} 검사 · 감지 ${matches.size}개"
         updateServiceNotification(idleText())
@@ -518,6 +579,7 @@ class ScannerService : Service() {
             val previousClosed = rows.getJSONArray(rows.length() - 2)
             val openPrice = current.getString(1).toDouble()
             val highPrice = current.getString(2).toDouble()
+            val lowPrice = current.getString(3).toDouble()
             val livePrice = current.getString(4).toDouble()
             val currentVolume = current.getString(5).toDouble()
             val previousVolume = previousClosed.getString(5).toDouble()
@@ -534,7 +596,7 @@ class ScannerService : Service() {
             if (highPct >= tf.highPct &&
                 changePct >= tf.livePct &&
                 volumeMultiple >= tf.volumeMultiple) {
-                Match(symbol, livePrice, highPct, changePct, volumeMultiple)
+                Match(symbol, livePrice, highPct, changePct, volumeMultiple, lowPrice, highPrice, System.currentTimeMillis())
             } else null
         } catch (_: Exception) {
             failures.incrementAndGet()
@@ -611,6 +673,7 @@ class ScannerService : Service() {
     }
 
     private fun updateServiceNotification(message: String) {
+        if (enabledTimeframes().isEmpty()) return
         getSystemService(NotificationManager::class.java)
             .notify(SERVICE_NOTIFICATION_ID, serviceNotification(message))
     }
@@ -655,8 +718,7 @@ class ScannerService : Service() {
     }
 
     override fun onDestroy() {
-        running.set(false)
-        // Do not clear persisted running state on unexpected teardown; explicit STOP clears it.
+        // Do not clear the persisted on/off switches here; only an explicit STOP does that.
         scheduler.shutdownNow()
         scannerPool.shutdownNow()
         super.onDestroy()

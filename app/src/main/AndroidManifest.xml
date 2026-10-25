@@ -24,6 +24,10 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".HistoryActivity"
+            android:exported="false" />
+
         <receiver
             android:name=".RestartReceiver"
             android:enabled="true"
