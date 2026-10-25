@@ -29,21 +29,29 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.max
 
 /**
- * One monitoring timeframe. Both timeframes use the same conditions, but each has its own
- * candle interval, its own scan times (Korea time) and its own saved results.
+ * One monitoring timeframe. Each timeframe has its own candle interval, its own scan times
+ * (Korea time), its own detection thresholds and its own saved results.
  *
  * scanMinutes: the minute of each hour at which the scan runs (at 5 seconds past the minute).
  *  - 1h  : :50          (10 minutes before the hourly candle closes)
  *  - 15m : :13 :28 :43 :58 (2 minutes before each 15-minute candle closes)
+ *
+ * Thresholds (change the numbers here to tune a timeframe):
+ *  - highPct        : candle high must be at least this % above the candle open
+ *  - livePct        : current price must be at least this % above the candle open
+ *  - volumeMultiple : current candle volume must be at least this many times the previous candle
  */
 enum class ScanTimeframe(
     val id: String,
     val interval: String,
     val label: String,
-    val scanMinutes: List<Int>
+    val scanMinutes: List<Int>,
+    val highPct: Double,
+    val livePct: Double,
+    val volumeMultiple: Double
 ) {
-    M15("m15", "15m", "15분봉", listOf(13, 28, 43, 58)),
-    H1("h1", "1h", "1시간봉", listOf(50));
+    M15("m15", "15m", "15분봉", listOf(13, 28, 43, 58), 4.0, 3.0, 4.5),
+    H1("h1", "1h", "1시간봉", listOf(50), 5.0, 4.0, 4.5);
 
     /** SharedPreferences key that belongs to this timeframe. */
     fun key(name: String): String = "${id}_$name"
@@ -60,9 +68,6 @@ class ScannerService : Service() {
         private const val CHANNEL_SERVICE = "scanner_status"
         private const val CHANNEL_ALERTS = "scanner_alerts"
         private const val SERVICE_NOTIFICATION_ID = 1001
-        private const val VOLUME_MULTIPLE_THRESHOLD = 4.5
-        private const val HIGH_CHANGE_THRESHOLD = 5.0
-        private const val LIVE_CHANGE_THRESHOLD = 4.0
         private val KST: ZoneId = ZoneId.of("Asia/Seoul")
         private val DISPLAY_TIME: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss", Locale.KOREA)
         private val SHORT_TIME: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm", Locale.KOREA)
@@ -309,7 +314,7 @@ class ScannerService : Service() {
     private fun performScan(tf: ScanTimeframe) {
         val startText = nowText()
         val tag = "[${tf.label}]"
-        appendLog(tf, "$startText | 검사 시작 (v1.6) | 바이낸스 USDT 무기한 종목 목록 조회 중")
+        appendLog(tf, "$startText | 검사 시작 (v1.7) | 바이낸스 USDT 무기한 종목 목록 조회 중")
         updateServiceNotification("$tag 종목 목록 조회 중…")
         prefs.edit()
             .putString(tf.key("last_outcome"), "검사 진행 중")
@@ -526,9 +531,9 @@ class ScannerService : Service() {
             val changePct = (livePrice - openPrice) / openPrice * 100.0
             val volumeMultiple = currentVolume / previousVolume
 
-            if (highPct >= HIGH_CHANGE_THRESHOLD &&
-                changePct >= LIVE_CHANGE_THRESHOLD &&
-                volumeMultiple >= VOLUME_MULTIPLE_THRESHOLD) {
+            if (highPct >= tf.highPct &&
+                changePct >= tf.livePct &&
+                volumeMultiple >= tf.volumeMultiple) {
                 Match(symbol, livePrice, highPct, changePct, volumeMultiple)
             } else null
         } catch (_: Exception) {
@@ -628,13 +633,9 @@ class ScannerService : Service() {
         val body = "고가/시가 +%.2f%% · 현재/시가 +%.2f%% · 거래량 %.2fx".format(
             Locale.US, match.highPct, match.changePct, match.volumeMultiple
         )
-        
-        // 요청하신 대로 "15분봉 급등 종목 알림" 또는 "1시간봉 급등 종목 알림" 형태로 개별 제목 지정
-        val alertTitle = "${tf.label} 급등 종목 알림: ${match.symbol}"
-
         val notification = NotificationCompat.Builder(this, CHANNEL_ALERTS)
             .setSmallIcon(android.R.drawable.ic_dialog_info)
-            .setContentTitle(alertTitle)
+            .setContentTitle("${tf.label} 급등 종목 알림: ${match.symbol}")
             .setContentText(body)
             .setStyle(NotificationCompat.BigTextStyle().bigText("$body\n현재가 ${match.price}"))
             .setContentIntent(openPending)
