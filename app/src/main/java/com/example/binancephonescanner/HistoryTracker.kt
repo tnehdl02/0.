@@ -25,16 +25,16 @@ object HistoryTracker {
     private const val WINDOW_MS = 5L * 24 * 60 * 60 * 1000
     private const val MINUTE_MS = 60_000L
 
-    /** Updates every unfinished detection of one timeframe. Returns how many were updated. */
-    fun update(context: Context, tf: ScanTimeframe): Int {
+    /** Updates every unfinished detection of one watch (latest price, stop-loss, 5-day peak). Returns how many were updated. */
+    fun update(context: Context, watch: Watch): Int {
         val now = System.currentTimeMillis()
-        val pending = ScanHistory.load(context, tf)
+        val pending = ScanHistory.load(context, watch)
             .flatMap { it.matches }
             .filter { it.isTrackable && !it.done }
 
         var updatedCount = 0
         if (pending.isNotEmpty()) {
-            val pool = Executors.newFixedThreadPool(4)
+            val pool = Executors.newFixedThreadPool(6)
             try {
                 val tasks = pending.map { match ->
                     Callable<ScanHistory.MatchRecord?> {
@@ -44,14 +44,14 @@ object HistoryTracker {
                 val updated = pool.invokeAll(tasks, 90, TimeUnit.SECONDS).mapNotNull { future ->
                     try { if (future.isCancelled) null else future.get() } catch (_: Exception) { null }
                 }
-                ScanHistory.applyTracking(context, tf, updated)
+                ScanHistory.applyTracking(context, watch, updated)
                 updatedCount = updated.size
             } finally {
                 pool.shutdownNow()
             }
         }
         context.getSharedPreferences(ScannerService.PREFS, Context.MODE_PRIVATE)
-            .edit().putLong(tf.key("track_updated"), now).apply()
+            .edit().putLong(watch.key("track_updated"), now).apply()
         return updatedCount
     }
 
@@ -65,6 +65,8 @@ object HistoryTracker {
         var peakTime = if (m.peakTime > 0L) m.peakTime else m.observedAt
         var peakBeforeStop = if (m.peakBeforeStop > 0.0) m.peakBeforeStop else m.price
         var lastOpen = start
+        var lastClose = if (m.lastPrice > 0.0) m.lastPrice else m.price
+        var lastCloseTime = m.lastPriceTime
 
         while (start <= fetchEnd) {
             val wanted = ((fetchEnd - start) / MINUTE_MS + 2).coerceIn(2L, 1500L).toInt()
@@ -79,11 +81,14 @@ object HistoryTracker {
                 val high = row.getString(2).toDouble()
                 val low = row.getString(3).toDouble()
 
-                // In the minute of the detection, part of the candle happened before the
-                // detection. A new high only counts if it beats the high known at detection.
-                // A low below the stop level can only have happened after the detection.
+                // The peak is counted from the candle AFTER the detected candle (peakStart), so
+                // the rest of the candle that met the conditions is excluded. Records saved by
+                // older versions have no peakStart: in the detection minute a new high only
+                // counts if it beats the high known at detection.
                 val detectionMinute = m.observedAt >= openTime && m.observedAt < openTime + MINUTE_MS
-                val highCounts = !detectionMinute || high > m.highAtDetection
+                val highCounts = if (m.peakStart > 0L) openTime >= m.peakStart
+                else (!detectionMinute || high > m.highAtDetection)
+                // A low below the stop level can only have happened after the detection.
                 val breaksStop = low < m.lowPrice
 
                 if (highCounts && high > peak) {
@@ -95,6 +100,8 @@ object HistoryTracker {
                     else if (highCounts && high > peakBeforeStop) peakBeforeStop = high
                 }
                 lastOpen = openTime
+                lastClose = row.getString(4).toDouble()
+                lastCloseTime = now
             }
             if (rows.length() < wanted) break
             start = lastOpen + MINUTE_MS
@@ -106,7 +113,9 @@ object HistoryTracker {
             peakPrice = peak,
             peakTime = peakTime,
             peakBeforeStop = peakBeforeStop,
-            done = now >= windowEnd + MINUTE_MS
+            done = now >= windowEnd + MINUTE_MS,
+            lastPrice = lastClose,
+            lastPriceTime = lastCloseTime
         )
     }
 

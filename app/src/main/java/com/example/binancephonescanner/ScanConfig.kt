@@ -1,7 +1,5 @@
 package com.example.binancephonescanner
 
-import android.content.Context
-import android.content.SharedPreferences
 import java.util.Locale
 
 /** 1 -> "1", 4.5 -> "4.5" */
@@ -10,7 +8,7 @@ fun formatNumber(value: Double): String =
     else String.format(Locale.US, "%.2f", value).trimEnd('0').trimEnd('.')
 
 /**
- * The settings of one monitor, chosen by the user:
+ * The settings of one watch, chosen by the user:
  *  - interval       : candle size ("1m", "5m", "15m", "1h", "4h" or "1d")
  *  - minutes        : the minutes of every hour at which the scan runs (Korea time)
  *  - highPct        : the candle high must be at least this many % above the candle open
@@ -24,7 +22,7 @@ data class ScanConfig(
     val livePct: Double,
     val volumeMultiple: Double
 ) {
-    val label: String get() = ScanConfigStore.INTERVALS[interval] ?: interval
+    val label: String get() = ScanOptions.INTERVALS[interval] ?: interval
 
     /** "매시 정각", "매시 50분", "매시 13분 · 28분 · 43분 · 58분" */
     fun scheduleText(): String {
@@ -40,12 +38,8 @@ data class ScanConfig(
             "• 거래량이 직전 완료봉의 ${formatNumber(volumeMultiple)}배 이상"
 }
 
-/**
- * Saves the settings on the phone and keeps a copy in memory. The app, the scan service and the
- * history screen all run in one process, so they always see the latest values; every entry
- * point calls [ensureLoaded] first.
- */
-object ScanConfigStore {
+/** Choices and input parsing for the settings dialog. */
+object ScanOptions {
     val INTERVALS: LinkedHashMap<String, String> = linkedMapOf(
         "1m" to "1분봉",
         "5m" to "5분봉",
@@ -54,46 +48,6 @@ object ScanConfigStore {
         "4h" to "4시간봉",
         "1d" to "1일봉"
     )
-
-    private const val FILE = "binance_scanner_config"
-    private val cache = HashMap<String, ScanConfig>()
-    private var loaded = false
-
-    @Synchronized
-    fun ensureLoaded(context: Context) {
-        if (loaded) return
-        val prefs = context.applicationContext.getSharedPreferences(FILE, Context.MODE_PRIVATE)
-        for (slot in ScanTimeframe.values()) cache[slot.id] = read(prefs, slot)
-        loaded = true
-    }
-
-    @Synchronized
-    fun current(slot: ScanTimeframe): ScanConfig = cache[slot.id] ?: slot.defaults
-
-    @Synchronized
-    fun save(context: Context, slot: ScanTimeframe, config: ScanConfig) {
-        ensureLoaded(context)
-        context.applicationContext.getSharedPreferences(FILE, Context.MODE_PRIVATE).edit()
-            .putString(slot.key("cfg_interval"), config.interval)
-            .putString(slot.key("cfg_minutes"), config.minutes.joinToString(","))
-            .putString(slot.key("cfg_high"), config.highPct.toString())
-            .putString(slot.key("cfg_live"), config.livePct.toString())
-            .putString(slot.key("cfg_volume"), config.volumeMultiple.toString())
-            .apply()
-        cache[slot.id] = config
-    }
-
-    private fun read(prefs: SharedPreferences, slot: ScanTimeframe): ScanConfig {
-        val d = slot.defaults
-        val interval = prefs.getString(slot.key("cfg_interval"), null)
-        return ScanConfig(
-            interval = if (interval != null && INTERVALS.containsKey(interval)) interval else d.interval,
-            minutes = parseMinutes(prefs.getString(slot.key("cfg_minutes"), null)) ?: d.minutes,
-            highPct = prefs.getString(slot.key("cfg_high"), null)?.toDoubleOrNull() ?: d.highPct,
-            livePct = prefs.getString(slot.key("cfg_live"), null)?.toDoubleOrNull() ?: d.livePct,
-            volumeMultiple = prefs.getString(slot.key("cfg_volume"), null)?.toDoubleOrNull() ?: d.volumeMultiple
-        )
-    }
 
     /**
      * "0, 15 30;45" -> [0, 15, 30, 45]. Returns null if the text is empty or has anything that

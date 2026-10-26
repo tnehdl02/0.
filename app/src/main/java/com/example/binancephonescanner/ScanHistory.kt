@@ -8,7 +8,7 @@ import java.util.concurrent.TimeUnit
 
 /**
  * Keeps the results of every successful scan for the last [RETENTION_DAYS] days, one file per
- * timeframe (history_m15.jsonl / history_h1.jsonl in the app's private storage). Each line is
+ * watch (history_<watch id>.jsonl in the app's private storage). Each line is
  * one scan: when it ran, how many symbols were checked and which symbols matched.
  *
  * Every matched symbol also carries tracking data (see [HistoryTracker]): the stop-loss level
@@ -48,12 +48,30 @@ object ScanHistory {
         val peakPrice: Double = 0.0,
         val peakTime: Long = 0L,
         val peakBeforeStop: Double = 0.0,
-        val done: Boolean = false
+        val done: Boolean = false,
+        val openPrice: Double = 0.0,
+        val peakStart: Long = 0L,
+        val candleLabel: String = "",
+        val lastPrice: Double = 0.0,
+        val lastPriceTime: Long = 0L
     ) {
         val isTrackable: Boolean get() = lowPrice > 0.0 && observedAt > 0L && price > 0.0
         val stopPct: Double get() = (lowPrice - price) / price * 100.0
         val peakPct: Double get() = (maxOf(peakPrice, price) - price) / price * 100.0
         val peakBeforeStopPct: Double get() = (maxOf(peakBeforeStop, price) - price) / price * 100.0
+
+        /** Latest known price (the entry price until the first refresh). */
+        val currentPrice: Double get() = if (lastPrice > 0.0) lastPrice else price
+
+        /** Profit/loss of the latest price against the entry price, in %. */
+        val profitPct: Double get() = (currentPrice - price) / price * 100.0
+
+        /** Opening price of the detected candle (derived for records saved by older versions). */
+        val candleOpen: Double
+            get() = if (openPrice > 0.0) openPrice else price / (1.0 + changePct / 100.0)
+
+        /** When the 5-day tracking window ends. */
+        val windowEnd: Long get() = observedAt + 5L * 24 * 60 * 60 * 1000
     }
 
     data class ScanRecord(
@@ -63,8 +81,8 @@ object ScanHistory {
         val matches: List<MatchRecord>
     )
 
-    private fun file(context: Context, tf: ScanTimeframe) =
-        File(context.filesDir, "history_${tf.id}.jsonl")
+    private fun file(context: Context, watch: Watch) =
+        File(context.filesDir, "history_${watch.id}.jsonl")
 
     private fun cutoffMillis(): Long =
         System.currentTimeMillis() - TimeUnit.DAYS.toMillis(RETENTION_DAYS)
@@ -73,9 +91,9 @@ object ScanHistory {
 
     /** Adds one scan and drops everything older than the retention period. */
     @Synchronized
-    fun append(context: Context, tf: ScanTimeframe, record: ScanRecord) {
+    fun append(context: Context, watch: Watch, record: ScanRecord) {
         val cutoff = cutoffMillis()
-        val target = file(context, tf)
+        val target = file(context, watch)
         val kept = ArrayList<String>()
         if (target.exists()) {
             target.readLines().forEach { line ->
@@ -90,8 +108,8 @@ object ScanHistory {
 
     /** All stored scans of the last [RETENTION_DAYS] days, oldest first. */
     @Synchronized
-    fun load(context: Context, tf: ScanTimeframe): List<ScanRecord> {
-        val source = file(context, tf)
+    fun load(context: Context, watch: Watch): List<ScanRecord> {
+        val source = file(context, watch)
         if (!source.exists()) return emptyList()
         val cutoff = cutoffMillis()
         val result = ArrayList<ScanRecord>()
@@ -113,10 +131,10 @@ object ScanHistory {
      * scan saved in the meantime, or two updates running at once, never lose data.
      */
     @Synchronized
-    fun applyTracking(context: Context, tf: ScanTimeframe, updates: List<MatchRecord>) {
+    fun applyTracking(context: Context, watch: Watch, updates: List<MatchRecord>) {
         if (updates.isEmpty()) return
         val byKey = updates.associateBy { keyOf(it) }
-        val target = file(context, tf)
+        val target = file(context, watch)
         if (!target.exists()) return
         val cutoff = cutoffMillis()
         val out = ArrayList<String>()
@@ -146,8 +164,36 @@ object ScanHistory {
             peakPrice = if (newerPeak) new.peakPrice else old.peakPrice,
             peakTime = if (newerPeak) new.peakTime else old.peakTime,
             peakBeforeStop = maxOf(old.peakBeforeStop, new.peakBeforeStop),
-            done = old.done || new.done
+            done = old.done || new.done,
+            peakStart = if (old.peakStart > 0L) old.peakStart else new.peakStart,
+            lastPrice = if (new.lastPriceTime >= old.lastPriceTime) new.lastPrice else old.lastPrice,
+            lastPriceTime = maxOf(old.lastPriceTime, new.lastPriceTime)
         )
+    }
+
+    /** Removes one detected symbol from the history. */
+    @Synchronized
+    fun deleteMatch(context: Context, watch: Watch, symbol: String, observedAt: Long) {
+        val target = file(context, watch)
+        if (!target.exists()) return
+        val out = ArrayList<String>()
+        target.readLines().forEach { line ->
+            if (line.isBlank()) return@forEach
+            try {
+                val record = fromJson(JSONObject(line))
+                val kept = record.matches.filter { !(it.symbol == symbol && it.observedAt == observedAt) }
+                out.add(toJson(record.copy(matches = kept)).toString())
+            } catch (_: Exception) {
+                out.add(line)
+            }
+        }
+        target.writeText(out.joinToString("\n") + "\n")
+    }
+
+    /** Deletes the whole history of a watch (used when the watch itself is deleted). */
+    @Synchronized
+    fun deleteAll(context: Context, watchId: String) {
+        File(context.filesDir, "history_$watchId.jsonl").delete()
     }
 
     private fun toJson(record: ScanRecord): JSONObject {
@@ -168,6 +214,11 @@ object ScanHistory {
                 put("pt", m.peakTime)
                 put("pb", m.peakBeforeStop)
                 put("d", m.done)
+                put("op", m.openPrice)
+                put("ps", m.peakStart)
+                put("cl", m.candleLabel)
+                put("lp", m.lastPrice)
+                put("lt", m.lastPriceTime)
             })
         }
         return JSONObject().apply {
@@ -198,7 +249,12 @@ object ScanHistory {
                     peakPrice = m.optDouble("pk", 0.0),
                     peakTime = m.optLong("pt", 0L),
                     peakBeforeStop = m.optDouble("pb", 0.0),
-                    done = m.optBoolean("d", false)
+                    done = m.optBoolean("d", false),
+                    openPrice = m.optDouble("op", 0.0),
+                    peakStart = m.optLong("ps", 0L),
+                    candleLabel = m.optString("cl", ""),
+                    lastPrice = m.optDouble("lp", 0.0),
+                    lastPriceTime = m.optLong("lt", 0L)
                 )
             )
         }

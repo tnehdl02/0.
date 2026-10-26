@@ -28,31 +28,13 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.max
 
-/**
- * One of the two monitors. The settings of a monitor (candle size, scan minutes, thresholds)
- * are chosen by the user and stored in [ScanConfigStore]; [defaults] are used until then.
- * The properties below always return the current settings.
- */
-enum class ScanTimeframe(val id: String, val defaults: ScanConfig) {
-    M15("m15", ScanConfig("15m", listOf(13, 28, 43, 58), 4.0, 3.0, 4.5)),
-    H1("h1", ScanConfig("1h", listOf(50), 5.0, 4.0, 4.5));
-
-    val config: ScanConfig get() = ScanConfigStore.current(this)
-    val interval: String get() = config.interval
-    val label: String get() = config.label
-    val scanMinutes: List<Int> get() = config.minutes
-
-    /** SharedPreferences key that belongs to this monitor. */
-    fun key(name: String): String = "${id}_$name"
-}
-
 class ScannerService : Service() {
     companion object {
         const val ACTION_START = "com.example.binancephonescanner.START"
         const val ACTION_STOP = "com.example.binancephonescanner.STOP"
         const val ACTION_SCAN = "com.example.binancephonescanner.SCAN"
-        const val EXTRA_TIMEFRAME = "timeframe"
-        private const val ALARM_REQUEST_BASE = 2000
+        const val EXTRA_WATCH_ID = "watch_id"
+        const val ALARM_REQUEST_BASE = 2000
         const val PREFS = "binance_scanner_state"
         private const val CHANNEL_SERVICE = "scanner_status"
         private const val CHANNEL_ALERTS = "scanner_alerts"
@@ -76,34 +58,39 @@ class ScannerService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        ScanConfigStore.ensureLoaded(this)
+        WatchStore.ensureLoaded(this)
         createChannels()
         startForeground(SERVICE_NOTIFICATION_ID, serviceNotification("감시 서비스 준비 중"))
     }
 
-    private fun isEnabled(tf: ScanTimeframe): Boolean = prefs.getBoolean(tf.key("enabled"), false)
+    private fun isEnabled(watch: Watch): Boolean = prefs.getBoolean(watch.key("enabled"), false)
 
-    private fun enabledTimeframes(): List<ScanTimeframe> = ScanTimeframe.values().filter { isEnabled(it) }
+    private fun enabledWatches(): List<Watch> = Watch.values().filter { isEnabled(it) }
 
     /** "running" stays true while at least one timeframe is switched on (used by RestartReceiver). */
     private fun syncRunningFlag() {
-        prefs.edit().putBoolean("running", enabledTimeframes().isNotEmpty()).apply()
+        prefs.edit().putBoolean("running", enabledWatches().isNotEmpty()).apply()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val requested = ScanTimeframe.values().firstOrNull { it.id == intent?.getStringExtra(EXTRA_TIMEFRAME) }
+        val requestedId = intent?.getStringExtra(EXTRA_WATCH_ID)
+        val requested = Watch.values().firstOrNull { it.id == requestedId }
         when (intent?.action) {
             ACTION_STOP -> {
-                // With a timeframe: switch only that one off. Without: switch everything off.
-                if (requested != null) disableTimeframe(requested)
-                else ScanTimeframe.values().forEach { disableTimeframe(it) }
+                // With a watch id: switch only that one off (it may already be deleted).
+                // Without one: switch everything off (the notification's stop button).
+                if (requestedId == null) Watch.values().forEach { disableWatch(it) }
+                else if (requested != null) disableWatch(requested)
             }
             ACTION_SCAN -> if (requested != null) handleScanAlarm(requested)
-            ACTION_START -> if (requested != null) enableTimeframe(requested) else resumeMonitoring()
+            ACTION_START -> {
+                if (requested != null) enableWatch(requested)
+                else if (requestedId == null) resumeMonitoring()
+            }
             // No action: the system restarted the service (or boot/update receiver).
             else -> resumeMonitoring()
         }
-        if (enabledTimeframes().isEmpty()) {
+        if (enabledWatches().isEmpty()) {
             syncRunningFlag()
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
@@ -112,12 +99,12 @@ class ScannerService : Service() {
         return START_STICKY
     }
 
-    /** Switches one timeframe on: schedules its alarms and runs one scan right away. */
-    private fun enableTimeframe(tf: ScanTimeframe) {
-        val alreadyEnabled = isEnabled(tf)
-        prefs.edit().putBoolean(tf.key("enabled"), true).apply()
+    /** Switches one watch on: schedules its alarms and runs one scan right away. */
+    private fun enableWatch(watch: Watch) {
+        val alreadyEnabled = isEnabled(watch)
+        prefs.edit().putBoolean(watch.key("enabled"), true).apply()
         syncRunningFlag()
-        scheduleAlarm(tf, afterFire = false)
+        scheduleAlarm(watch, afterFire = false)
         refreshNextScanPrefs()
         updateServiceNotification(idleText())
         if (alreadyEnabled) return
@@ -126,16 +113,16 @@ class ScannerService : Service() {
         try {
             scheduler.execute {
                 try {
-                    appendLog(tf, "${nowText()} | 감시 시작 | 즉시 검사 시작")
-                    performScan(tf)
+                    appendLog(watch, "${nowText()} | 감시 시작 | 즉시 검사 시작")
+                    performScan(watch)
                 } catch (e: Exception) {
                     val message = "첫 검사 오류: ${e.message ?: e.javaClass.simpleName}"
-                    appendLog(tf, "${nowText()} | 검사 실패 | $message")
+                    appendLog(watch, "${nowText()} | 검사 실패 | $message")
                     prefs.edit()
-                        .putString(tf.key("last_outcome"), "검사 실패")
-                        .putBoolean("scan_in_progress", false)
+                        .putString(watch.key("last_outcome"), "검사 실패")
+                        .putBoolean(watch.key("scan_in_progress"), false)
                         .apply()
-                    updateServiceNotification("[${tf.label}] 검사 오류 · 인터넷 연결을 확인하세요")
+                    updateServiceNotification("[${watch.name}] 검사 오류 · 인터넷 연결을 확인하세요")
                 } finally {
                     releaseWakeLock(wakeLock)
                     updateServiceNotification(idleText())
@@ -143,33 +130,33 @@ class ScannerService : Service() {
             }
         } catch (e: Exception) {
             releaseWakeLock(wakeLock)
-            cancelAlarm(tf)
+            cancelAlarm(watch)
             val reason = e.message ?: e.javaClass.simpleName
             prefs.edit()
-                .putBoolean(tf.key("enabled"), false)
-                .putString(tf.key("last_outcome"), "감시 시작 실패: $reason")
+                .putBoolean(watch.key("enabled"), false)
+                .putString(watch.key("last_outcome"), "감시 시작 실패: $reason")
                 .apply()
             syncRunningFlag()
-            appendLog(tf, "${nowText()} | 감시 시작 실패 | $reason")
+            appendLog(watch, "${nowText()} | 감시 시작 실패 | $reason")
             refreshNextScanPrefs()
         }
     }
 
-    /** Switches one timeframe off. The service itself stops when no timeframe is left. */
-    private fun disableTimeframe(tf: ScanTimeframe) {
-        cancelAlarm(tf)
+    /** Switches one watch off. The service itself stops when no watch is left. */
+    private fun disableWatch(watch: Watch) {
+        cancelAlarm(watch)
         val editor = prefs.edit()
-            .putBoolean(tf.key("enabled"), false)
-            .putString(tf.key("next_scan"), "감시 중지")
-        if (prefs.getString("scan_label", "") == tf.label) editor.putBoolean("scan_in_progress", false)
+            .putBoolean(watch.key("enabled"), false)
+            .putString(watch.key("next_scan"), "감시 중지")
+        editor.putBoolean(watch.key("scan_in_progress"), false)
         editor.apply()
         syncRunningFlag()
         updateServiceNotification(idleText())
     }
 
-    /** After a system restart, re-arm the alarms of every timeframe that was switched on. */
+    /** After a system restart, re-arm the alarms of every watch that was switched on. */
     private fun resumeMonitoring() {
-        enabledTimeframes().forEach { scheduleAlarm(it, afterFire = false) }
+        enabledWatches().forEach { scheduleAlarm(it, afterFire = false) }
         syncRunningFlag()
         refreshNextScanPrefs()
         updateServiceNotification(idleText())
@@ -180,23 +167,23 @@ class ScannerService : Service() {
      * chain never breaks even if the scan itself fails. A stale alarm of a switched-off
      * timeframe is ignored.
      */
-    private fun handleScanAlarm(tf: ScanTimeframe) {
-        if (!isEnabled(tf)) return
-        scheduleAlarm(tf, afterFire = true)
+    private fun handleScanAlarm(watch: Watch) {
+        if (!isEnabled(watch)) return
+        scheduleAlarm(watch, afterFire = true)
         refreshNextScanPrefs()
         val wakeLock = acquireWakeLock()
         try {
             scheduler.execute {
                 try {
-                    performScan(tf)
+                    performScan(watch)
                 } catch (e: Exception) {
                     val message = "검사 오류: ${e.message ?: e.javaClass.simpleName}"
-                    appendLog(tf, "${nowText()} | 검사 실패 | $message")
+                    appendLog(watch, "${nowText()} | 검사 실패 | $message")
                     prefs.edit()
-                        .putString(tf.key("last_outcome"), "검사 실패")
-                        .putBoolean("scan_in_progress", false)
+                        .putString(watch.key("last_outcome"), "검사 실패")
+                        .putBoolean(watch.key("scan_in_progress"), false)
                         .apply()
-                    updateServiceNotification("[${tf.label}] 검사 오류 · 인터넷 연결을 확인하세요")
+                    updateServiceNotification("[${watch.name}] 검사 오류 · 인터넷 연결을 확인하세요")
                 } finally {
                     releaseWakeLock(wakeLock)
                     updateServiceNotification(idleText())
@@ -204,30 +191,30 @@ class ScannerService : Service() {
             }
         } catch (e: Exception) {
             releaseWakeLock(wakeLock)
-            appendLog(tf, "${nowText()} | 실패 | 검사 예약 실행 오류: ${e.message ?: e.javaClass.simpleName}")
+            appendLog(watch, "${nowText()} | 실패 | 검사 예약 실행 오류: ${e.message ?: e.javaClass.simpleName}")
         }
     }
 
     // ---- Alarms & wake lock ---------------------------------------------------------------
 
-    private fun alarmPendingIntent(tf: ScanTimeframe): PendingIntent {
+    private fun alarmPendingIntent(watch: Watch): PendingIntent {
         val intent = Intent(this, ScannerService::class.java).apply {
             action = ACTION_SCAN
-            putExtra(EXTRA_TIMEFRAME, tf.id)
+            putExtra(EXTRA_WATCH_ID, watch.id)
         }
         return PendingIntent.getForegroundService(
-            this, ALARM_REQUEST_BASE + tf.ordinal, intent,
+            this, ALARM_REQUEST_BASE + watch.num, intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
     }
 
-    private fun scheduleAlarm(tf: ScanTimeframe, afterFire: Boolean) {
+    private fun scheduleAlarm(watch: Watch, afterFire: Boolean) {
         // After an alarm fires, look slightly ahead so an alarm that fires a moment early
         // cannot schedule the same scan time again.
         val base = ZonedDateTime.now(KST).plusSeconds(if (afterFire) 30 else 0)
-        val triggerAt = nextTarget(tf, base).toInstant().toEpochMilli()
+        val triggerAt = nextTarget(watch, base).toInstant().toEpochMilli()
         val alarmManager = getSystemService(AlarmManager::class.java)
-        val pending = alarmPendingIntent(tf)
+        val pending = alarmPendingIntent(watch)
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && !alarmManager.canScheduleExactAlarms()) {
                 alarmManager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, pending)
@@ -239,9 +226,9 @@ class ScannerService : Service() {
         }
     }
 
-    private fun cancelAlarm(tf: ScanTimeframe) {
+    private fun cancelAlarm(watch: Watch) {
         try {
-            getSystemService(AlarmManager::class.java).cancel(alarmPendingIntent(tf))
+            getSystemService(AlarmManager::class.java).cancel(alarmPendingIntent(watch))
         } catch (_: Exception) {
         }
     }
@@ -266,30 +253,30 @@ class ScannerService : Service() {
 
     // ---- Schedule -------------------------------------------------------------------------
 
-    private fun nextTarget(tf: ScanTimeframe, now: ZonedDateTime = ZonedDateTime.now(KST)): ZonedDateTime {
+    private fun nextTarget(watch: Watch, now: ZonedDateTime = ZonedDateTime.now(KST)): ZonedDateTime {
         val hourStart = now.truncatedTo(ChronoUnit.HOURS)
         for (hourOffset in 0L..1L) {
-            for (minute in tf.scanMinutes) {
+            for (minute in watch.scanMinutes) {
                 val target = hourStart.plusHours(hourOffset).withMinute(minute).withSecond(5).withNano(0)
                 if (now.isBefore(target)) return target
             }
         }
-        return hourStart.plusHours(2).withMinute(tf.scanMinutes.first()).withSecond(5).withNano(0)
+        return hourStart.plusHours(2).withMinute(watch.scanMinutes.first()).withSecond(5).withNano(0)
     }
 
     /** Among the timeframes that are switched on: which scan comes first, and when. Null if none. */
-    private fun nextScheduled(): Pair<ScanTimeframe, ZonedDateTime>? {
+    private fun nextScheduled(): Pair<Watch, ZonedDateTime>? {
         val now = ZonedDateTime.now(KST)
-        return enabledTimeframes()
+        return enabledWatches()
             .map { it to nextTarget(it, now) }
             .minByOrNull { it.second.toInstant().toEpochMilli() }
     }
 
-    private fun nextScanText(tf: ScanTimeframe): String = nextTarget(tf).format(DISPLAY_TIME) + " KST"
+    private fun nextScanText(watch: Watch): String = nextTarget(watch).format(DISPLAY_TIME) + " KST"
 
     private fun refreshNextScanPrefs() {
         val editor = prefs.edit()
-        ScanTimeframe.values().forEach {
+        Watch.values().forEach {
             editor.putString(it.key("next_scan"), if (isEnabled(it)) nextScanText(it) else "감시 중지")
         }
         editor.apply()
@@ -297,9 +284,9 @@ class ScannerService : Service() {
 
     /** Text for the ongoing notification while waiting for the next scan. */
     private fun idleText(): String {
-        val (tf, target) = nextScheduled() ?: return "감시 꺼짐"
-        val next = "다음 ${tf.label} ${target.format(SHORT_TIME)}"
-        val labels = enabledTimeframes().joinToString("·") { it.label }
+        val (watch, target) = nextScheduled() ?: return "감시 꺼짐"
+        val next = "다음 ${watch.name} ${target.format(SHORT_TIME)}"
+        val labels = enabledWatches().joinToString("·") { it.name }
         return if (lastStatusLine.isBlank()) "감시 실행 중($labels) · $next" else "$lastStatusLine · $next"
     }
 
@@ -313,19 +300,21 @@ class ScannerService : Service() {
         val volumeMultiple: Double,
         val lowPrice: Double,
         val highPrice: Double,
-        val observedAt: Long
+        val observedAt: Long,
+        val openPrice: Double,
+        val peakStart: Long,
+        val candleLabel: String
     )
 
     // ---- Scan -----------------------------------------------------------------------------
 
-    private fun performScan(tf: ScanTimeframe) {
+    private fun performScan(watch: Watch) {
         val startText = nowText()
-        val tag = "[${tf.label}]"
-        appendLog(tf, "$startText | 검사 시작 (v2.0) | 바이낸스 USDT 무기한 종목 목록 조회 중")
+        val tag = "[${watch.name}]"
+        appendLog(watch, "$startText | 검사 시작 (v2.1) | 바이낸스 USDT 무기한 종목 목록 조회 중")
         updateServiceNotification("$tag 종목 목록 조회 중…")
         prefs.edit()
-            .putString(tf.key("last_outcome"), "검사 진행 중")
-            .putString("scan_label", tf.label)
+            .putString(watch.key("last_outcome"), "검사 진행 중")
             .apply()
 
         val symbols = try {
@@ -333,18 +322,18 @@ class ScannerService : Service() {
         } catch (e: Exception) {
             val endText = nowText()
             prefs.edit()
-                .putString(tf.key("last_scan_time"), endText)
-                .putInt(tf.key("last_scanned"), 0)
-                .putInt(tf.key("last_match_count"), 0)
-                .putInt(tf.key("last_failures"), 1)
-                .putString(tf.key("last_matches"), "[]")
-                .putString(tf.key("last_outcome"), "검사 실패")
-                .putInt("scan_progress_done", 0)
-                .putInt("scan_progress_total", 0)
-                .putInt("scan_progress_percent", 0)
-                .putBoolean("scan_in_progress", false)
+                .putString(watch.key("last_scan_time"), endText)
+                .putInt(watch.key("last_scanned"), 0)
+                .putInt(watch.key("last_match_count"), 0)
+                .putInt(watch.key("last_failures"), 1)
+                .putString(watch.key("last_matches"), "[]")
+                .putString(watch.key("last_outcome"), "검사 실패")
+                .putInt(watch.key("scan_progress_done"), 0)
+                .putInt(watch.key("scan_progress_total"), 0)
+                .putInt(watch.key("scan_progress_percent"), 0)
+                .putBoolean(watch.key("scan_in_progress"), false)
                 .apply()
-            appendLog(tf, "$startText | 검사 실패 | 종목 목록을 가져오지 못함: ${e.message ?: e.javaClass.simpleName}")
+            appendLog(watch, "$startText | 검사 실패 | 종목 목록을 가져오지 못함: ${e.message ?: e.javaClass.simpleName}")
             lastStatusLine = "$tag 검사 실패"
             updateServiceNotification("$tag 검사 실패 · 종목 목록 조회 오류")
             return
@@ -353,18 +342,18 @@ class ScannerService : Service() {
         if (symbols.isEmpty()) {
             val endText = nowText()
             prefs.edit()
-                .putString(tf.key("last_scan_time"), endText)
-                .putInt(tf.key("last_scanned"), 0)
-                .putInt(tf.key("last_match_count"), 0)
-                .putInt(tf.key("last_failures"), 1)
-                .putString(tf.key("last_matches"), "[]")
-                .putString(tf.key("last_outcome"), "검사 실패: 종목 0개")
-                .putInt("scan_progress_done", 0)
-                .putInt("scan_progress_total", 0)
-                .putInt("scan_progress_percent", 0)
-                .putBoolean("scan_in_progress", false)
+                .putString(watch.key("last_scan_time"), endText)
+                .putInt(watch.key("last_scanned"), 0)
+                .putInt(watch.key("last_match_count"), 0)
+                .putInt(watch.key("last_failures"), 1)
+                .putString(watch.key("last_matches"), "[]")
+                .putString(watch.key("last_outcome"), "검사 실패: 종목 0개")
+                .putInt(watch.key("scan_progress_done"), 0)
+                .putInt(watch.key("scan_progress_total"), 0)
+                .putInt(watch.key("scan_progress_percent"), 0)
+                .putBoolean(watch.key("scan_in_progress"), false)
                 .apply()
-            appendLog(tf, "$startText | 검사 실패 | 조회된 USDT 무기한 종목이 0개")
+            appendLog(watch, "$startText | 검사 실패 | 조회된 USDT 무기한 종목이 0개")
             lastStatusLine = "$tag 검사 실패"
             updateServiceNotification("$tag 검사 실패 · 종목 0개")
             return
@@ -374,11 +363,10 @@ class ScannerService : Service() {
         val completed = AtomicInteger(0)
         val progressStep = max(1, symbols.size / 100)
         prefs.edit()
-            .putInt("scan_progress_done", 0)
-            .putInt("scan_progress_total", symbols.size)
-            .putInt("scan_progress_percent", 0)
-            .putBoolean("scan_in_progress", true)
-            .putString("scan_label", tf.label)
+            .putInt(watch.key("scan_progress_done"), 0)
+            .putInt(watch.key("scan_progress_total"), symbols.size)
+            .putInt(watch.key("scan_progress_percent"), 0)
+            .putBoolean(watch.key("scan_in_progress"), true)
             .apply()
         synchronized(progressLock) {
             lastProgressDone = 0
@@ -386,7 +374,7 @@ class ScannerService : Service() {
         }
         updateServiceNotification("$tag 검사 중 · 0/${symbols.size} · 0%")
 
-        val cfg = tf.config
+        val cfg = watch.config
         val tasks = symbols.map { symbol ->
             Callable {
                 try {
@@ -394,7 +382,7 @@ class ScannerService : Service() {
                 } finally {
                     val done = completed.incrementAndGet()
                     if (done % progressStep == 0 || done == symbols.size) {
-                        publishProgress(tf, done, symbols.size)
+                        publishProgress(watch, done, symbols.size)
                     }
                 }
             }
@@ -417,11 +405,11 @@ class ScannerService : Service() {
             failures.incrementAndGet()
         }
 
-        if (!isEnabled(tf)) {
+        if (!isEnabled(watch)) {
             // The user switched this timeframe off while the scan was running: drop the results.
             prefs.edit()
-                .putBoolean("scan_in_progress", false)
-                .putString(tf.key("last_outcome"), "감시 중지됨")
+                .putBoolean(watch.key("scan_in_progress"), false)
+                .putString(watch.key("last_outcome"), "감시 중지됨")
                 .apply()
             return
         }
@@ -449,16 +437,16 @@ class ScannerService : Service() {
 
         refreshNextScanPrefs()
         prefs.edit()
-            .putString(tf.key("last_scan_time"), endText)
-            .putInt(tf.key("last_scanned"), symbols.size)
-            .putInt(tf.key("last_match_count"), matches.size)
-            .putInt(tf.key("last_failures"), failureCount)
-            .putString(tf.key("last_matches"), matchJson.toString())
-            .putString(tf.key("last_outcome"), outcome)
-            .putInt("scan_progress_done", symbols.size)
-            .putInt("scan_progress_total", symbols.size)
-            .putInt("scan_progress_percent", 100)
-            .putBoolean("scan_in_progress", false)
+            .putString(watch.key("last_scan_time"), endText)
+            .putInt(watch.key("last_scanned"), symbols.size)
+            .putInt(watch.key("last_match_count"), matches.size)
+            .putInt(watch.key("last_failures"), failureCount)
+            .putString(watch.key("last_matches"), matchJson.toString())
+            .putString(watch.key("last_outcome"), outcome)
+            .putInt(watch.key("scan_progress_done"), symbols.size)
+            .putInt(watch.key("scan_progress_total"), symbols.size)
+            .putInt(watch.key("scan_progress_percent"), 100)
+            .putBoolean(watch.key("scan_in_progress"), false)
             .apply()
 
         val logLine = buildString {
@@ -476,13 +464,13 @@ class ScannerService : Service() {
                 if (matches.size > 30) append(" | 외 ${matches.size - 30}개")
             }
         }
-        appendLog(tf, logLine)
+        appendLog(watch, logLine)
 
         // Keep the result for 5 days so the history screen can compare symbols over time.
         if (failureCount < symbols.size) {
             try {
                 ScanHistory.append(
-                    this, tf,
+                    this, watch,
                     ScanHistory.ScanRecord(
                         System.currentTimeMillis(), symbols.size, failureCount,
                         matches.map {
@@ -494,6 +482,11 @@ class ScannerService : Service() {
                                 volumeMultiple = it.volumeMultiple,
                                 lowPrice = it.lowPrice,
                                 highAtDetection = it.highPrice,
+                                openPrice = it.openPrice,
+                                candleLabel = it.candleLabel,
+                                peakStart = it.peakStart,
+                                lastPrice = it.price,
+                                lastPriceTime = it.observedAt,
                                 observedAt = it.observedAt,
                                 peakPrice = it.price,
                                 peakTime = it.observedAt,
@@ -507,13 +500,13 @@ class ScannerService : Service() {
         }
 
         // One separate notification per detected coin.
-        if (failureCount < symbols.size) matches.forEach { sendMatchNotification(tf, it) }
+        if (failureCount < symbols.size) matches.forEach { sendMatchNotification(watch, it) }
         // Follow up on earlier detections (stop-loss / 5-day peak). Alerts above go out first.
         updateServiceNotification("$tag 감지 종목 추적 결과 갱신 중…")
         try {
-            HistoryTracker.update(this, tf)
+            HistoryTracker.update(this, watch)
         } catch (e: Exception) {
-            appendLog(tf, "${nowText()} | 추적 갱신 실패 | ${e.message ?: e.javaClass.simpleName}")
+            appendLog(watch, "${nowText()} | 추적 갱신 실패 | ${e.message ?: e.javaClass.simpleName}")
         }
         try { Thread.sleep(1000) } catch (_: InterruptedException) {}
         lastStatusLine = "$tag ${ZonedDateTime.now(KST).format(SHORT_TIME)} 검사 · 감지 ${matches.size}개"
@@ -523,20 +516,20 @@ class ScannerService : Service() {
     // Serialize progress updates from the worker threads. Without this, updates can arrive
     // out of order (e.g. 85/524 posted after 524/524) and Android may drop notification
     // updates that are posted too quickly, leaving a stale count in the notification bar.
-    private fun publishProgress(tf: ScanTimeframe, done: Int, total: Int) {
+    private fun publishProgress(watch: Watch, done: Int, total: Int) {
         synchronized(progressLock) {
             if (done < lastProgressDone) return
             lastProgressDone = done
             val percent = (done * 100 / total).coerceIn(0, 100)
             prefs.edit()
-                .putInt("scan_progress_done", done)
-                .putInt("scan_progress_total", total)
-                .putInt("scan_progress_percent", percent)
+                .putInt(watch.key("scan_progress_done"), done)
+                .putInt(watch.key("scan_progress_total"), total)
+                .putInt(watch.key("scan_progress_percent"), percent)
                 .apply()
             val now = SystemClock.elapsedRealtime()
             if (now - lastNotifyAt >= 800L && done < total) {
                 lastNotifyAt = now
-                updateServiceNotification("[${tf.label}] 검사 중 · $done/$total · $percent%")
+                updateServiceNotification("[${watch.name}] 검사 중 · $done/$total · $percent%")
             }
         }
     }
@@ -571,6 +564,8 @@ class ScannerService : Service() {
             val openPrice = current.getString(1).toDouble()
             val highPrice = current.getString(2).toDouble()
             val lowPrice = current.getString(3).toDouble()
+            // The detected candle closes at this time; the 5-day peak is counted from the next candle.
+            val candleCloseTime = current.getLong(6)
             val livePrice = current.getString(4).toDouble()
             val currentVolume = current.getString(5).toDouble()
             val previousVolume = previousClosed.getString(5).toDouble()
@@ -587,7 +582,10 @@ class ScannerService : Service() {
             if (highPct >= cfg.highPct &&
                 changePct >= cfg.livePct &&
                 volumeMultiple >= cfg.volumeMultiple) {
-                Match(symbol, livePrice, highPct, changePct, volumeMultiple, lowPrice, highPrice, System.currentTimeMillis())
+                Match(
+                    symbol, livePrice, highPct, changePct, volumeMultiple, lowPrice, highPrice,
+                    System.currentTimeMillis(), openPrice, candleCloseTime + 1L, cfg.label
+                )
             } else null
         } catch (_: Exception) {
             failures.incrementAndGet()
@@ -612,8 +610,8 @@ class ScannerService : Service() {
         }
     }
 
-    private fun appendLog(tf: ScanTimeframe, line: String) {
-        val logKey = tf.key("scan_logs")
+    private fun appendLog(watch: Watch, line: String) {
+        val logKey = watch.key("scan_logs")
         synchronized(prefs) {
             val old = prefs.getString(logKey, "") ?: ""
             val lines = (old.lines().filter { it.isNotBlank() } + line.take(1200)).takeLast(5)
@@ -664,16 +662,16 @@ class ScannerService : Service() {
     }
 
     private fun updateServiceNotification(message: String) {
-        if (enabledTimeframes().isEmpty()) return
+        if (enabledWatches().isEmpty()) return
         getSystemService(NotificationManager::class.java)
             .notify(SERVICE_NOTIFICATION_ID, serviceNotification(message))
     }
 
     /**
      * Posts one standalone notification for a detected coin. Each alert has a unique id and
-     * independent title ("15분봉 급등 종목 알림" / "1시간봉 급등 종목 알림"), so Android does not bundle them.
+     * independent title ("[감시 1] 15분봉 급등 종목 알림"), so Android does not bundle them.
      */
-    private fun sendMatchNotification(tf: ScanTimeframe, match: Match) {
+    private fun sendMatchNotification(watch: Watch, match: Match) {
         val manager = getSystemService(NotificationManager::class.java)
         val id = alertIdCounter.incrementAndGet()
         val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
@@ -689,7 +687,7 @@ class ScannerService : Service() {
         )
         val notification = NotificationCompat.Builder(this, CHANNEL_ALERTS)
             .setSmallIcon(android.R.drawable.ic_dialog_info)
-            .setContentTitle("${tf.label} 급등 종목 알림: ${match.symbol}")
+            .setContentTitle("[${watch.name}] ${match.candleLabel} 급등 종목 알림: ${match.symbol}")
             .setContentText(body)
             .setStyle(NotificationCompat.BigTextStyle().bigText("$body\n현재가 ${match.price}"))
             .setContentIntent(openPending)

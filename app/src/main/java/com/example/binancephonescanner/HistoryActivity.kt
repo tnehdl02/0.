@@ -1,5 +1,6 @@
 package com.example.binancephonescanner
 
+import android.app.AlertDialog
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
@@ -7,6 +8,7 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
+import android.view.Gravity
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -19,34 +21,30 @@ import java.util.Locale
 import java.util.TimeZone
 
 /**
- * Shows the last 5 days of results for one timeframe (15-minute or 1-hour):
- * which symbols were detected how often, every detection in time order, and the recent scan log.
+ * History of one watch: every detected symbol of the last 5 days as its own card, with the
+ * detection data, the current price, the stop-loss status and the 5-day peak.
+ * Red = stop-loss was hit, green = in profit, white = in loss.
  */
 class HistoryActivity : ComponentActivity() {
     private val timeFormat by lazy {
         SimpleDateFormat("MM-dd HH:mm", Locale.KOREA).apply { timeZone = TimeZone.getTimeZone("Asia/Seoul") }
     }
 
-    private class SymbolStats(val symbol: String) {
-        var count = 0
-        var maxHighPct = 0.0
-        var volumeSum = 0.0
-        var lastTime = 0L
-        var tracked = 0
-        var stopped = 0
-        var peakSum = 0.0
-    }
+    private val red = Color.rgb(255, 99, 99)
+    private val green = Color.rgb(80, 238, 150)
+    private val white = Color.rgb(240, 245, 250)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        ScanConfigStore.ensureLoaded(this)
-        val tf = ScanTimeframe.values().firstOrNull { it.id == intent.getStringExtra(ScannerService.EXTRA_TIMEFRAME) }
-        if (tf == null) {
+        WatchStore.ensureLoaded(this)
+        val watchId = intent.getStringExtra(ScannerService.EXTRA_WATCH_ID)
+        val watch = Watch.values().firstOrNull { it.id == watchId }
+        if (watch == null) {
             finish()
             return
         }
         try {
-            buildScreen(tf)
+            buildScreen(watch)
         } catch (e: Throwable) {
             val message = TextView(this).apply {
                 text = "기록 화면 오류: ${e.message ?: e.javaClass.simpleName}"
@@ -57,7 +55,7 @@ class HistoryActivity : ComponentActivity() {
         }
     }
 
-    private fun buildScreen(tf: ScanTimeframe) {
+    private fun buildScreen(watch: Watch) {
         val scroll = ScrollView(this).apply {
             background = GradientDrawable(
                 GradientDrawable.Orientation.TL_BR,
@@ -67,7 +65,7 @@ class HistoryActivity : ComponentActivity() {
         }
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(24), dp(20), dp(30))
+            setPadding(dp(20), dp(28), dp(20), dp(30))
         }
         scroll.addView(root)
         setContentView(scroll)
@@ -76,196 +74,172 @@ class HistoryActivity : ComponentActivity() {
         back.setOnClickListener { finish() }
         root.addView(back, LinearLayout.LayoutParams(dp(130), dp(42)).apply { bottomMargin = dp(14) })
 
-        root.addView(text("감시 ${tf.ordinal + 1} · ${tf.label} 기록", 26f, Color.rgb(236, 249, 255), true))
+        root.addView(text("${watch.name} 기록", 26f, Color.rgb(236, 249, 255), true))
         root.addView(
             text("최근 ${ScanHistory.RETENTION_DAYS}일 · 이 휴대폰에만 저장됩니다 (한국 시간)", 12f, Color.rgb(78, 232, 193), true),
-            margin(0, 5, 0, 16)
+            margin(0, 5, 0, 14)
         )
 
-        val trackUpdated = getSharedPreferences(ScannerService.PREFS, MODE_PRIVATE).getLong(tf.key("track_updated"), 0L)
-        val refresh = button("추적 결과 새로고침", Color.rgb(38, 116, 180))
+        // Refresh: downloads the latest price of every symbol that is still tracked.
+        val updatedAt = getSharedPreferences(ScannerService.PREFS, MODE_PRIVATE).getLong(watch.key("track_updated"), 0L)
+        val refresh = button("새로고침 (현재가 갱신)", Color.rgb(38, 116, 180))
         refresh.setOnClickListener {
             refresh.isEnabled = false
-            refresh.text = "갱신 중… (최대 1분)"
+            refresh.text = "현재가 불러오는 중… (최대 1분)"
             Thread {
                 try {
-                    HistoryTracker.update(this, tf)
+                    HistoryTracker.update(this, watch)
                 } catch (_: Exception) {
                 }
-                runOnUiThread { if (!isFinishing) buildScreen(tf) }
+                runOnUiThread { if (!isFinishing) buildScreen(watch) }
             }.start()
         }
         root.addView(refresh, LinearLayout.LayoutParams(-1, dp(44)).apply { bottomMargin = dp(4) })
         root.addView(
             text(
-                if (trackUpdated > 0L) "마지막 추적 갱신: ${timeFormat.format(Date(trackUpdated))}" else "아직 추적 갱신 전입니다.",
+                if (updatedAt > 0L) "마지막 갱신: ${timeFormat.format(Date(updatedAt))}" else "아직 현재가를 갱신하지 않았습니다.",
                 12f, Color.rgb(174, 194, 211), false
             ),
-            margin(0, 0, 0, 14)
+            margin(0, 0, 0, 12)
         )
 
-        val records = ScanHistory.load(this, tf)
-        val detections = records.filter { it.matches.isNotEmpty() }
-        val allMatches = records.flatMap { rec -> rec.matches.map { rec.timeMillis to it } }
+        val matches = ScanHistory.load(this, watch)
+            .flatMap { it.matches }
+            .sortedByDescending { it.observedAt }
 
-        // ---- Summary ----
+        // ---- Short summary ----
+        val trackable = matches.filter { it.isTrackable }
+        val trackingCount = trackable.count { !it.done }
+        val stoppedCount = trackable.count { it.stopTime > 0L }
+        val losingCount = trackable.count { it.stopTime == 0L && it.profitPct < 0.0 }
+        val winningCount = trackable.count { it.stopTime == 0L && it.profitPct > 0.0 }
+
         val summaryCard = card()
-        summaryCard.addView(text("요약", 17f, Color.WHITE, true))
-        val summary = if (records.isEmpty()) {
-            "아직 저장된 기록이 없습니다.\n감시를 켜고 검사가 한 번 끝나면 여기에 쌓입니다."
-        } else {
-            "검사 ${records.size}회 중 감지가 있었던 검사 ${detections.size}회\n" +
-                "감지 ${allMatches.size}건 · 서로 다른 종목 ${allMatches.map { it.second.symbol }.toSet().size}개\n" +
-                "기록 범위: ${timeFormat.format(Date(records.first().timeMillis))} ~ ${timeFormat.format(Date(records.last().timeMillis))}"
-        }
-        summaryCard.addView(text(summary, 13f, Color.rgb(197, 214, 229), false), margin(0, 8, 0, 0))
+        summaryCard.addView(text("현재 추적 중 ${trackingCount}개", 17f, Color.WHITE, true))
+        val counts = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        counts.addView(text("손절 발생 ${stoppedCount}개", 14f, red, true), LinearLayout.LayoutParams(0, -2, 1f))
+        counts.addView(text("손실 중 ${losingCount}개", 14f, white, true).apply { gravity = Gravity.CENTER }, LinearLayout.LayoutParams(0, -2, 1f))
+        counts.addView(text("수익 중 ${winningCount}개", 14f, green, true).apply { gravity = Gravity.END }, LinearLayout.LayoutParams(0, -2, 1f))
+        summaryCard.addView(counts, margin(0, 8, 0, 0))
+        root.addView(summaryCard, margin(0, 0, 0, 14))
 
-        // Tracking result: stop-loss = low of the detected candle; peak = highest price within 5 days.
-        val trackedMatches = allMatches.map { it.second }.filter { it.isTrackable }
-        summaryCard.addView(text("추적 결과", 15f, Color.WHITE, true), margin(0, 14, 0, 4))
-        val trackingSummary = if (trackedMatches.isEmpty()) {
-            "아직 추적 중인 감지가 없습니다. (손절선 = 감지된 봉의 저가)"
-        } else {
-            val stopped = trackedMatches.count { it.stopTime > 0L }
-            val notStopped = trackedMatches.filter { it.stopTime == 0L }
-            val avgPeakAll = trackedMatches.map { it.peakPct }.average()
-            val avgPeakNoStop = if (notStopped.isEmpty()) null else notStopped.map { it.peakPct }.average()
-            val maxPeak = trackedMatches.maxOf { it.peakPct }
-            "추적 ${trackedMatches.size}건 · 손절 발생 ${stopped}건 · 손절 없음 ${notStopped.size}건\n" +
-                "평균 고점 +${"%.2f".format(Locale.US, avgPeakAll)}%" +
-                (if (avgPeakNoStop != null) " (손절 없는 건만 +${"%.2f".format(Locale.US, avgPeakNoStop)}%)" else "") +
-                " · 최대 고점 +${"%.2f".format(Locale.US, maxPeak)}%\n" +
-                "손절선 = 감지된 봉의 저가 / 고점 = 감지 후 5일 내 최고가 (손절 무시)\n" +
-                "고점은 진입가(감지 시 현재가) 대비 %입니다."
-        }
-        summaryCard.addView(text(trackingSummary, 13f, Color.rgb(197, 214, 229), false))
-        root.addView(summaryCard, margin(0, 0, 0, 12))
-
-        // ---- Per-symbol statistics ----
-        val stats = HashMap<String, SymbolStats>()
-        allMatches.forEach { (time, m) ->
-            val st = stats.getOrPut(m.symbol) { SymbolStats(m.symbol) }
-            st.count += 1
-            st.volumeSum += m.volumeMultiple
-            if (m.highPct > st.maxHighPct) st.maxHighPct = m.highPct
-            if (time > st.lastTime) st.lastTime = time
-            if (m.isTrackable) {
-                st.tracked += 1
-                if (m.stopTime > 0L) st.stopped += 1
-                st.peakSum += m.peakPct
-            }
-        }
-        val ranking = stats.values.sortedWith(compareByDescending<SymbolStats> { it.count }.thenByDescending { it.maxHighPct })
-
-        val rankCard = card()
-        rankCard.addView(text("종목별 감지 횟수", 17f, Color.WHITE, true))
-        rankCard.addView(
-            text("많이 감지된 종목이 먼저 나옵니다. 누르면 종목명이 복사됩니다.", 12f, Color.rgb(174, 194, 211), false),
-            margin(0, 4, 0, 10)
+        // ---- One card per detected symbol (newest first) ----
+        root.addView(text("감지된 종목", 18f, Color.WHITE, true), margin(0, 0, 0, 4))
+        root.addView(
+            text("빨강: 손절선 터치 · 초록: 수익 중 · 흰색: 손실 중 (감지 당시 가격 기준)", 12f, Color.rgb(174, 194, 211), false),
+            margin(0, 0, 0, 10)
         )
-        if (ranking.isEmpty()) {
-            rankCard.addView(text("감지된 종목이 없습니다.", 13f, Color.rgb(174, 194, 211), false))
+        if (matches.isEmpty()) {
+            val empty = card()
+            empty.addView(text("감지된 종목이 없습니다.", 13f, Color.rgb(174, 194, 211), false))
+            root.addView(empty, margin(0, 0, 0, 12))
         } else {
-            ranking.take(30).forEachIndexed { index, st ->
-                val avgVolume = st.volumeSum / st.count
-                val trackLine = if (st.tracked > 0) {
-                    "\n   손절 ${st.stopped}/${st.tracked}회 · 평균 고점 +${"%.2f".format(Locale.US, st.peakSum / st.tracked)}%"
-                } else ""
-                val row = text(
-                    "${index + 1}. ${st.symbol}   ${st.count}회\n" +
-                        "   최대 고가 +${"%.2f".format(Locale.US, st.maxHighPct)}% · 평균 거래량 ${"%.1f".format(Locale.US, avgVolume)}배 · 마지막 ${timeFormat.format(Date(st.lastTime))}" +
-                        trackLine,
-                    13f, Color.rgb(213, 227, 239), false
-                )
-                row.setOnClickListener { copySymbol(st.symbol) }
-                rankCard.addView(row, margin(0, 0, 0, 8))
-            }
-            if (ranking.size > 30) {
-                rankCard.addView(text("… 외 ${ranking.size - 30}개 종목", 12f, Color.rgb(174, 194, 211), false))
-            }
-        }
-        root.addView(rankCard, margin(0, 0, 0, 12))
-
-        // ---- Detections in time order (newest first) ----
-        val listCard = card()
-        listCard.addView(text("감지 기록 (최신순)", 17f, Color.WHITE, true))
-        listCard.addView(
-            text("검사 시각별로 묶어서 보여줍니다. 종목을 누르면 복사됩니다.", 12f, Color.rgb(174, 194, 211), false),
-            margin(0, 4, 0, 10)
-        )
-        if (detections.isEmpty()) {
-            listCard.addView(text("감지 기록이 없습니다.", 13f, Color.rgb(174, 194, 211), false))
-        } else {
-            val maxRows = 300
-            var shown = 0
-            for (record in detections.asReversed()) {
-                if (shown >= maxRows) break
-                listCard.addView(
-                    text(
-                        "${timeFormat.format(Date(record.timeMillis))} 검사 · 감지 ${record.matches.size}개 / ${record.scanned}종목",
-                        13f, Color.rgb(91, 235, 194), true
-                    ),
-                    margin(0, 10, 0, 4)
-                )
-                for (m in record.matches) {
-                    if (shown >= maxRows) break
-                    val row = text(
-                        "${m.symbol}\n고가 +${"%.2f".format(Locale.US, m.highPct)}% · 현재 +${"%.2f".format(Locale.US, m.changePct)}% · 거래량 ${"%.2f".format(Locale.US, m.volumeMultiple)}배" +
-                            trackingDetail(m),
-                        12f, Color.rgb(213, 227, 239), false
-                    ).apply {
-                        setPadding(dp(10), dp(8), dp(10), dp(8))
-                        background = rounded(Color.argb(110, 30, 52, 73), dp(10))
-                    }
-                    row.setOnClickListener { copySymbol(m.symbol) }
-                    listCard.addView(row, margin(0, 0, 0, 6))
-                    shown += 1
-                }
-            }
-            val total = detections.sumOf { it.matches.size }
-            if (total > shown) {
-                listCard.addView(
-                    text("가장 최근 ${shown}건만 표시했습니다 (전체 ${total}건).", 12f, Color.rgb(174, 194, 211), false),
-                    margin(0, 8, 0, 0)
+            val maxCards = 100
+            for (m in matches.take(maxCards)) root.addView(matchCard(watch, m), margin(0, 0, 0, 10))
+            if (matches.size > maxCards) {
+                root.addView(
+                    text("가장 최근 ${maxCards}건만 표시했습니다 (전체 ${matches.size}건).", 12f, Color.rgb(174, 194, 211), false),
+                    margin(0, 0, 0, 10)
                 )
             }
         }
-        root.addView(listCard, margin(0, 0, 0, 12))
 
-        // ---- Recent scan log (last 5 lines) ----
+        // ---- Recent scan log ----
         val logCard = card()
         logCard.addView(text("최근 검사 로그", 17f, Color.WHITE, true))
-        val log = getSharedPreferences(ScannerService.PREFS, MODE_PRIVATE).getString(tf.key("scan_logs"), "") ?: ""
-        val logText = if (log.isBlank()) "아직 검사 로그가 없습니다." else log
+        val log = getSharedPreferences(ScannerService.PREFS, MODE_PRIVATE).getString(watch.key("scan_logs"), "") ?: ""
         logCard.addView(
-            text(logText, 12f, Color.rgb(190, 208, 224), false).apply { typeface = Typeface.MONOSPACE },
+            text(if (log.isBlank()) "아직 검사 로그가 없습니다." else log, 12f, Color.rgb(190, 208, 224), false)
+                .apply { typeface = Typeface.MONOSPACE },
             margin(0, 8, 0, 0)
         )
         root.addView(logCard)
     }
 
-    /** Extra lines under a detection: stop-loss level, whether it was hit, and the 5-day peak. */
-    private fun trackingDetail(m: ScanHistory.MatchRecord): String {
-        if (!m.isTrackable) return "\n(이전 버전 기록 · 추적 정보 없음)"
-        val stopped = m.stopTime > 0L
-        val stopState = if (stopped) "손절 발생 ${timeFormat.format(Date(m.stopTime))}" else "손절 없음"
-        val sb = StringBuilder()
-        sb.append("\n진입 ${formatPrice(m.price)} · 손절선 ${formatPrice(m.lowPrice)} (${"%.2f".format(Locale.US, m.stopPct)}%) · $stopState")
-        if (m.peakPrice > m.price) {
-            sb.append("\n5일 고점 ${formatPrice(m.peakPrice)} (+${"%.2f".format(Locale.US, m.peakPct)}%, ${timeFormat.format(Date(m.peakTime))})")
+    private fun pct(value: Double): String = String.format(Locale.US, "%+.2f", value) + "%"
+
+    private fun matchCard(watch: Watch, m: ScanHistory.MatchRecord): LinearLayout {
+        val stopped = m.isTrackable && m.stopTime > 0L
+        val color = when {
+            stopped -> red
+            m.isTrackable && m.profitPct > 0.0 -> green
+            else -> white
+        }
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(14), dp(14), dp(12))
+            background = rounded(Color.argb(125, 25, 42, 62), dp(16), Color.argb(150, Color.red(color), Color.green(color), Color.blue(color)))
+        }
+
+        // Name on top
+        val head = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        head.addView(text(m.symbol, 19f, color, true), LinearLayout.LayoutParams(0, -2, 1f))
+        val detectedLabel = (if (m.candleLabel.isBlank()) "" else m.candleLabel + " · ") + "감지 " + timeFormat.format(Date(m.observedAt))
+        head.addView(text(detectedLabel, 11f, Color.rgb(174, 194, 211), false))
+        card.addView(head)
+
+        // 1. At the time of detection
+        val open = m.candleOpen
+        val high = if (m.highAtDetection > 0.0) m.highAtDetection else open * (1.0 + m.highPct / 100.0)
+        val volumePct = (m.volumeMultiple - 1.0) * 100.0
+        val lines = StringBuilder()
+        lines.append("① 감지 당시\n")
+        lines.append("   가격 ${formatPrice(m.price)} · 거래량 ${String.format(Locale.US, "%.2f", m.volumeMultiple)}배 (${pct(volumePct)})\n")
+        lines.append("   시가 ${formatPrice(open)} · 고가 ${formatPrice(high)} (${pct(m.highPct)}) · 종가 ${formatPrice(m.price)} (${pct(m.changePct)})")
+
+        if (!m.isTrackable) {
+            lines.append("\n(이전 버전 기록 · 추적 정보 없음)")
         } else {
-            sb.append("\n5일 고점: 진입가 위로 오르지 않음")
+            // 2. Current price
+            lines.append("\n② 현재 가격 ${formatPrice(m.currentPrice)} (감지 당시 대비 ${pct(m.profitPct)})")
+            if (m.lastPriceTime > 0L) lines.append(" · ${timeFormat.format(Date(m.lastPriceTime))} 기준")
+
+            // 3. Stop-loss
+            lines.append("\n③ 손절선 ${formatPrice(m.lowPrice)} (감지 당시 대비 ${pct(m.stopPct)}) · ")
+            if (stopped) lines.append("터치함 ${timeFormat.format(Date(m.stopTime))}") else lines.append("터치 안 함")
+
+            // 4. Peak within 5 days, excluding the detected candle
+            lines.append("\n④ 5일 고점 ")
+            val now = System.currentTimeMillis()
+            if (m.peakStart > 0L && now < m.peakStart) {
+                lines.append("감지된 봉이 마감된 뒤부터 집계 (${timeFormat.format(Date(m.peakStart))}~)")
+            } else if (m.peakPrice > m.price) {
+                lines.append("${formatPrice(m.peakPrice)} (진입가 대비 ${pct(m.peakPct)}, ${timeFormat.format(Date(m.peakTime))})")
+            } else {
+                lines.append("진입가 위로 오르지 않음")
+            }
+            if (stopped && m.peakBeforeStop > m.price) lines.append("\n   손절 전 고점 ${pct(m.peakBeforeStopPct)}")
+            lines.append("\n   집계 종료 ${timeFormat.format(Date(m.windowEnd))}")
+            lines.append(if (m.done) " (종료됨)" else " (추적 중)")
         }
-        if (stopped && m.peakBeforeStop > m.price) {
-            sb.append("\n손절 전 고점 +${"%.2f".format(Locale.US, m.peakBeforeStopPct)}%")
-        }
-        if (!m.done) sb.append("\n추적 중 (감지 후 5일까지)")
-        return sb.toString()
+        card.addView(text(lines.toString(), 12.5f, color, false), margin(0, 8, 0, 8))
+
+        // Copy / delete
+        val buttons = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val copy = button("종목명 복사", Color.rgb(0, 142, 116))
+        copy.setOnClickListener { copySymbol(m.symbol) }
+        val delete = button("삭제", Color.rgb(150, 60, 70))
+        delete.setOnClickListener { confirmDelete(watch, m) }
+        buttons.addView(copy, LinearLayout.LayoutParams(0, dp(40), 3f))
+        buttons.addView(delete, LinearLayout.LayoutParams(0, dp(40), 1f).apply { marginStart = dp(8) })
+        card.addView(buttons)
+        return card
     }
 
-    private fun formatPrice(value: Double): String =
-        if (value >= 1000) "%,.3f".format(Locale.US, value)
-        else "%.8f".format(Locale.US, value).trimEnd('0').trimEnd('.')
+    private fun confirmDelete(watch: Watch, m: ScanHistory.MatchRecord) {
+        AlertDialog.Builder(this)
+            .setTitle("기록 삭제")
+            .setMessage("${m.symbol} (${timeFormat.format(Date(m.observedAt))} 감지) 기록을 삭제할까요?")
+            .setNegativeButton("취소", null)
+            .setPositiveButton("삭제") { _, _ ->
+                ScanHistory.deleteMatch(this, watch, m.symbol, m.observedAt)
+                buildScreen(watch)
+            }
+            .show()
+    }
 
     private fun copySymbol(symbol: String) {
         try {
@@ -276,6 +250,10 @@ class HistoryActivity : ComponentActivity() {
             Toast.makeText(this, "복사하지 못했습니다.", Toast.LENGTH_SHORT).show()
         }
     }
+
+    private fun formatPrice(value: Double): String =
+        if (value >= 1000) "%,.3f".format(Locale.US, value)
+        else "%.8f".format(Locale.US, value).trimEnd('0').trimEnd('.')
 
     private fun card(): LinearLayout = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL
