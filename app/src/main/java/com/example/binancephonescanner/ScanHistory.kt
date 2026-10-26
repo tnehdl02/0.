@@ -171,6 +171,18 @@ object ScanHistory {
         )
     }
 
+    /**
+     * Symbols that already have a record still being followed: the stop-loss was not hit and
+     * the 5-day window is not over. A new detection of such a symbol is not recorded again.
+     */
+    @Synchronized
+    fun openSymbols(context: Context, watch: Watch): Set<String> =
+        load(context, watch)
+            .flatMap { it.matches }
+            .filter { it.stopTime == 0L && !it.done }
+            .map { it.symbol }
+            .toSet()
+
     /** Removes one detected symbol from the history. */
     @Synchronized
     fun deleteMatch(context: Context, watch: Watch, symbol: String, observedAt: Long) {
