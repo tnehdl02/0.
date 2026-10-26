@@ -476,7 +476,7 @@ class ScannerService : Service() {
         // record already hit its stop-loss, the new detection is saved as a new record.
         if (failureCount < symbols.size) {
             try {
-                var recordable = matches
+                var recordable: List<Match> = matches
                 if (matches.isNotEmpty()) {
                     var open = ScanHistory.openSymbols(this, watch)
                     if (matches.any { it.symbol in open }) {
