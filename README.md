@@ -21,3 +21,8 @@ This project keeps the existing scanner service and detection conditions unchang
 - Public Binance USDⓈ-M Futures endpoints are used; no API key is required.
 - Historical data requests require internet access and can take time for many detections.
 - Open trades are labeled `진행 중` and are not included in closed-trade win/loss counts or compound balance until an exit level is reached.
+
+
+## Build fix: ViewPager dependency
+
+`MainActivity.kt` imports `androidx.viewpager.widget.ViewPager` and `PagerAdapter`. The app module must include `implementation("androidx.viewpager:viewpager:1.0.0")` in `app/build.gradle.kts`. This dependency is included in this archive. When updating GitHub, upload/replace the entire project, including `app/build.gradle.kts`, not only the Kotlin source files.
