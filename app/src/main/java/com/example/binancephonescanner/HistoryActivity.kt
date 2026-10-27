@@ -146,7 +146,7 @@ class HistoryActivity : ComponentActivity() {
         closed.sortedBy { it.detected }.forEach { t -> val net=t.netPct/100.0; balance*=1+net; if(net>0)wins++ else losses++ }
         val card=LinearLayout(this).apply { orientation=LinearLayout.VERTICAL;setPadding(dp(14),dp(14),dp(14),dp(14));background=rounded(Color.rgb(19,34,53)) }
         card.addView(label("복리 결과",17f,fg,true)); card.addView(label("시작 원금  ${money(initial)} USDT",13f,muted,false),margin(0,7,0,0));card.addView(label("현재/최종 자산  ${money(balance)} USDT",19f,if(balance>=initial) Color.rgb(80,238,150) else Color.rgb(255,99,99),true),margin(0,5,0,0));card.addView(label("총수익률  ${pct((balance/initial-1)*100)}",15f,fg,true),margin(0,4,0,0))
-        val total= wins+losses;card.addView(label("익절 $wins회 · 손절 $losses회 · 승률 ${if(total>0) String.format(Locale.US,"%.2f",wins*100.0/total) else "0.00"}%",14f,fg,true),margin(0,8,0,0))
+        val total= wins+losses;card.addView(label("익절 ${wins}회 · 손절 ${losses}회 · 승률 ${if(total>0) String.format(Locale.US,"%.2f",wins*100.0/total) else "0.00"}%",14f,fg,true),margin(0,8,0,0))
         val started=prefs.getLong("startedAt",trades.minOfOrNull{it.detected}?:0L);val end=if(trades.any{it.result=="진행 중"})System.currentTimeMillis() else trades.maxOfOrNull{it.exitAt}?:System.currentTimeMillis()
         card.addView(label("감시 기간: ${if(started>0)timeFmt.format(Date(started)) else "-"} ~ ${timeFmt.format(Date(end))}",12f,muted,false),margin(0,5,0,0));root.addView(card,margin(0,14,0,0))
     }
