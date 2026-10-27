@@ -12,8 +12,8 @@ android {
         applicationId = "com.example.binancephonescanner"
         minSdk = 26
         targetSdk = 35
-        versionCode = 11
-        versionName = "2.0"
+        versionCode = 12
+        versionName = "2.1"
     }
 
     compileOptions {
@@ -27,6 +27,8 @@ android {
 }
 
 dependencies {
+    // Required by MainActivity.kt (ViewPager and PagerAdapter)
     implementation("androidx.activity:activity-ktx:1.9.3")
     implementation("androidx.core:core-ktx:1.15.0")
+    implementation("androidx.viewpager:viewpager:1.0.0")
 }
