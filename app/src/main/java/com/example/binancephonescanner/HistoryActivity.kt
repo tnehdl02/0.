@@ -1,294 +1,169 @@
 package com.example.binancephonescanner
 
 import android.app.AlertDialog
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.Context
 import android.graphics.Color
-import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.view.Gravity
-import android.widget.Button
-import android.widget.LinearLayout
-import android.widget.ScrollView
-import android.widget.TextView
-import android.widget.Toast
+import android.widget.*
 import androidx.activity.ComponentActivity
+import org.json.JSONArray
+import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
+import kotlin.math.max
 
-/**
- * History of one watch: every detected symbol of the last 5 days as its own card, with the
- * detection data, the current price, the stop-loss status and the 5-day peak.
- * Red = stop-loss was hit, green = in profit, white = in loss.
- */
+/** Paper-scalping simulator. Scanner detection and service code are intentionally untouched. */
 class HistoryActivity : ComponentActivity() {
-    private val timeFormat by lazy {
-        SimpleDateFormat("MM-dd HH:mm", Locale.KOREA).apply { timeZone = TimeZone.getTimeZone("Asia/Seoul") }
-    }
+    private val prefs by lazy { getSharedPreferences("paper_scalper", MODE_PRIVATE) }
+    private val timeFmt = SimpleDateFormat("MM-dd HH:mm:ss", Locale.KOREA).apply { timeZone = TimeZone.getTimeZone("Asia/Seoul") }
+    private val bg = Color.rgb(8, 16, 31)
+    private val fg = Color.rgb(238, 246, 255)
+    private val muted = Color.rgb(164, 185, 207)
+    private var busy = false
+    private lateinit var root: LinearLayout
+    private lateinit var watch: Watch
 
-    private val red = Color.rgb(255, 99, 99)
-    private val green = Color.rgb(80, 238, 150)
-    private val white = Color.rgb(240, 245, 250)
+    data class Trade(val symbol:String,val detected:Long,val entry:Double,val stop:Double,val target:Double,val exit:Double,val exitAt:Long,val result:String,val reason:String) {
+        val duration:Long get() = if (exitAt > 0) max(0L, exitAt-detected) else 0L
+        val grossPct:Double get() = if(exit>0 && entry>0) (exit-entry)/entry*100.0 else 0.0
+        val netPct:Double get() = grossPct - 0.10 // Futures market taker fee estimate: 0.05% each side; no slippage.
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         WatchStore.ensureLoaded(this)
-        val watchId = intent.getStringExtra(ScannerService.EXTRA_WATCH_ID)
-        val watch = Watch.values().firstOrNull { it.id == watchId }
-        if (watch == null) {
-            finish()
-            return
-        }
-        try {
-            buildScreen(watch)
-        } catch (e: Throwable) {
-            val message = TextView(this).apply {
-                text = "기록 화면 오류: ${e.message ?: e.javaClass.simpleName}"
-                setTextColor(Color.WHITE)
-                setPadding(dp(20), dp(40), dp(20), dp(20))
-            }
-            setContentView(message)
-        }
+        val id = intent.getStringExtra(ScannerService.EXTRA_WATCH_ID)
+        watch = Watch.values().firstOrNull { it.id == id } ?: run { finish(); return }
+        render()
     }
 
-    private fun buildScreen(watch: Watch) {
-        val scroll = ScrollView(this).apply {
-            background = GradientDrawable(
-                GradientDrawable.Orientation.TL_BR,
-                intArrayOf(Color.rgb(7, 13, 28), Color.rgb(15, 31, 49), Color.rgb(18, 20, 38))
-            )
-            isFillViewport = true
-        }
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(28), dp(20), dp(30))
-        }
-        scroll.addView(root)
-        setContentView(scroll)
+    private fun render() {
+        val scroll = ScrollView(this).apply { setBackgroundColor(bg); isFillViewport = true }
+        root = LinearLayout(this).apply { orientation=LinearLayout.VERTICAL; setPadding(dp(18),dp(22),dp(18),dp(28)) }
+        scroll.addView(root); setContentView(scroll)
+        root.addView(button("← 돌아가기", Color.rgb(52,84,112)) { finish() }, lp(-1,dp(42)))
+        root.addView(label("모의 스캘핑 기록",26f,fg,true), margin(0,14,0,4))
+        root.addView(label("${watch.name} · 감지된 순서대로 시뮬레이션 · 한국 시간",12f,muted,false), margin(0,0,0,14))
 
-        val back = button("← 돌아가기", Color.rgb(52, 84, 112))
-        back.setOnClickListener { finish() }
-        root.addView(back, LinearLayout.LayoutParams(dp(130), dp(42)).apply { bottomMargin = dp(14) })
+        val capital = numberPref("capital", 100000.0)
+        val capitalInput = EditText(this).apply { setText(if (capital > 0) capital.toLong().toString() else "100000"); hint="원금 (USDT)"; setTextColor(fg); setHintTextColor(muted); inputType=android.text.InputType.TYPE_CLASS_NUMBER or android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL; setPadding(dp(12),dp(8),dp(12),dp(8)); background=rounded(Color.rgb(20,34,53)) }
+        root.addView(label("시작 원금 (USDT)",14f,fg,true), margin(0,0,0,5)); root.addView(capitalInput, lp(-1,dp(48)))
 
-        root.addView(text("${watch.name} 기록", 26f, Color.rgb(236, 249, 255), true))
-        root.addView(
-            text("최근 ${ScanHistory.RETENTION_DAYS}일 · 이 휴대폰에만 저장됩니다 (한국 시간)", 12f, Color.rgb(78, 232, 193), true),
-            margin(0, 5, 0, 14)
-        )
+        val stopMode = prefs.getString("stopMode", "previous") ?: "previous"
+        val stopGroup = RadioGroup(this).apply { orientation=RadioGroup.VERTICAL }
+        val prevRadio = RadioButton(this).apply { text="손절: 감지 순간 봉 기준 n봉 전 봉의 저가"; setTextColor(fg); id=1; isChecked=stopMode=="previous" }
+        val pctRadio = RadioButton(this).apply { text="손절: 진입가 대비 고정 하락률"; setTextColor(fg); id=2; isChecked=stopMode=="percent" }
+        stopGroup.addView(prevRadio); stopGroup.addView(pctRadio)
+        root.addView(label("손절 방식",15f,fg,true), margin(0,14,0,2)); root.addView(stopGroup)
+        val nInput = numericInput(prefs.getInt("nBars",1).toString(),"n봉 전 (예: 1)")
+        val stopPctInput = numericInput(prefs.getFloat("stopPct",2f).toString(),"고정 손절률 (%) 예: 2")
+        root.addView(label("과거 봉 개수 n (n=1은 직전 완료된 1시간 봉)",12f,muted,false), margin(0,2,0,4)); root.addView(nInput, lp(-1,dp(44)))
+        root.addView(label("고정 손절 하락률 (%)",12f,muted,false), margin(0,8,0,4)); root.addView(stopPctInput, lp(-1,dp(44)))
+        val tpInput = numericInput(prefs.getFloat("tpPct",3f).toString(),"익절 상승률 (%) 예: 3")
+        root.addView(label("익절: 진입가 대비 n% 상승",15f,fg,true), margin(0,14,0,4)); root.addView(tpInput, lp(-1,dp(44)))
+        root.addView(label("수수료: USDⓈ-M 선물 시장가 가정 0.05% 진입 + 0.05% 청산 · 슬리피지 제외",11f,muted,false), margin(0,7,0,8))
+        root.addView(button(if(busy) "계산 중…" else "설정 저장 및 모의매매 계산",Color.rgb(24,133,115)) {
+            val cap=capitalInput.text.toString().toDoubleOrNull() ?: 0.0
+            val n=nInput.text.toString().toIntOrNull() ?: 1
+            val sl=stopPctInput.text.toString().toDoubleOrNull() ?: 2.0
+            val tp=tpInput.text.toString().toDoubleOrNull() ?: 3.0
+            if(cap<=0 || n<1 || sl<=0 || tp<=0) { toast("원금과 비율은 0보다 커야 하며 n은 1 이상이어야 합니다."); return@button }
+            prefs.edit().putFloat("capital",cap.toFloat()).putString("stopMode",if(prevRadio.isChecked) "previous" else "percent").putInt("nBars",n).putFloat("stopPct",sl.toFloat()).putFloat("tpPct",tp.toFloat()).apply()
+            calculate(cap,if(prevRadio.isChecked) "previous" else "percent",n,sl,tp)
+        }, margin(0,5,0,12))
+        val saved = loadTrades()
+        showSummary(saved, capital)
+        root.addView(button("기록 전체 삭제",Color.rgb(151,55,70)) {
+            AlertDialog.Builder(this).setTitle("모의매매 기록 전체 삭제").setMessage("저장된 모의매매 결과를 모두 삭제할까요? 감시 기록은 삭제되지 않습니다.").setNegativeButton("취소",null).setPositiveButton("전체 삭제") { _,_-> prefs.edit().remove("trades").remove("startedAt").apply(); render() }.show()
+        }, margin(0,10,0,14))
+        root.addView(label("거래 기록 (${saved.size}건)",18f,fg,true), margin(0,0,0,8))
+        if(saved.isEmpty()) root.addView(cardText("아직 모의매매 기록이 없습니다. 설정을 저장하고 계산을 실행하세요."))
+        saved.forEachIndexed { index,t -> root.addView(tradeCard(index+1,t), margin(0,0,0,9)) }
+    }
 
-        // Refresh: downloads the latest price of every symbol that is still tracked.
-        val updatedAt = getSharedPreferences(ScannerService.PREFS, MODE_PRIVATE).getLong(watch.key("track_updated"), 0L)
-        val refresh = button("새로고침 (현재가 갱신)", Color.rgb(38, 116, 180))
-        refresh.setOnClickListener {
-            refresh.isEnabled = false
-            refresh.text = "현재가 불러오는 중… (최대 1분)"
-            Thread {
+    private fun calculate(capital:Double, mode:String, n:Int, slPct:Double, tpPct:Double) {
+        if(busy)return; busy=true; render()
+        Thread {
+            val detections = ScanHistory.load(this,watch).flatMap { it.matches }.distinctBy { "${it.symbol}|${it.observedAt}" }.sortedBy { it.observedAt }
+            val trades=ArrayList<Trade>()
+            for(m in detections) {
+                if(m.price<=0 || m.observedAt<=0) continue
                 try {
-                    HistoryTracker.update(this, watch)
-                } catch (_: Exception) {
-                }
-                runOnUiThread { if (!isFinishing) buildScreen(watch) }
-            }.start()
-        }
-        root.addView(refresh, LinearLayout.LayoutParams(-1, dp(44)).apply { bottomMargin = dp(4) })
-        root.addView(
-            text(
-                if (updatedAt > 0L) "마지막 갱신: ${timeFormat.format(Date(updatedAt))}" else "아직 현재가를 갱신하지 않았습니다.",
-                12f, Color.rgb(174, 194, 211), false
-            ),
-            margin(0, 0, 0, 12)
-        )
-
-        val matches = ScanHistory.load(this, watch)
-            .flatMap { it.matches }
-            .sortedByDescending { it.observedAt }
-
-        // ---- Short summary ----
-        val trackable = matches.filter { it.isTrackable }
-        val trackingCount = trackable.count { !it.done }
-        val stoppedCount = trackable.count { it.stopTime > 0L }
-        val losingCount = trackable.count { it.stopTime == 0L && it.profitPct < 0.0 }
-        val winningCount = trackable.count { it.stopTime == 0L && it.profitPct > 0.0 }
-
-        val summaryCard = card()
-        summaryCard.addView(text("현재 추적 중 ${trackingCount}개", 17f, Color.WHITE, true))
-        val counts = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        counts.addView(text("손절 발생 ${stoppedCount}개", 14f, red, true), LinearLayout.LayoutParams(0, -2, 1f))
-        counts.addView(text("손실 중 ${losingCount}개", 14f, white, true).apply { gravity = Gravity.CENTER }, LinearLayout.LayoutParams(0, -2, 1f))
-        counts.addView(text("수익 중 ${winningCount}개", 14f, green, true).apply { gravity = Gravity.END }, LinearLayout.LayoutParams(0, -2, 1f))
-        summaryCard.addView(counts, margin(0, 8, 0, 0))
-        root.addView(summaryCard, margin(0, 0, 0, 14))
-
-        // ---- One card per detected symbol (newest first) ----
-        root.addView(text("감지된 종목", 18f, Color.WHITE, true), margin(0, 0, 0, 4))
-        root.addView(
-            text("빨강: 손절선 터치 · 초록: 수익 중 · 흰색: 손실 중 (감지 당시 가격 기준)", 12f, Color.rgb(174, 194, 211), false),
-            margin(0, 0, 0, 10)
-        )
-        if (matches.isEmpty()) {
-            val empty = card()
-            empty.addView(text("감지된 종목이 없습니다.", 13f, Color.rgb(174, 194, 211), false))
-            root.addView(empty, margin(0, 0, 0, 12))
-        } else {
-            val maxCards = 100
-            for (m in matches.take(maxCards)) root.addView(matchCard(watch, m), margin(0, 0, 0, 10))
-            if (matches.size > maxCards) {
-                root.addView(
-                    text("가장 최근 ${maxCards}건만 표시했습니다 (전체 ${matches.size}건).", 12f, Color.rgb(174, 194, 211), false),
-                    margin(0, 0, 0, 10)
-                )
+                    val entry=m.price; val stop=if(mode=="percent") entry*(1-slPct/100.0) else previousLow(m.symbol,m.observedAt,n)
+                    if(stop<=0 || stop>=entry) continue
+                    val target=entry*(1+tpPct/100.0)
+                    val outcome=scanExit(m.symbol,m.observedAt,stop,target)
+                    trades.add(Trade(m.symbol,m.observedAt,entry,stop,target,outcome.first,outcome.second,outcome.third,outcome.fourth))
+                } catch (_:Exception) { trades.add(Trade(m.symbol,m.observedAt,m.price,if(mode=="percent")m.price*(1-slPct/100) else 0.0,m.price*(1+tpPct/100),0.0,0L,"진행 중","가격 데이터 조회 실패")) }
             }
-        }
-
-        // ---- Recent scan log ----
-        val logCard = card()
-        logCard.addView(text("최근 검사 로그", 17f, Color.WHITE, true))
-        val log = getSharedPreferences(ScannerService.PREFS, MODE_PRIVATE).getString(watch.key("scan_logs"), "") ?: ""
-        logCard.addView(
-            text(if (log.isBlank()) "아직 검사 로그가 없습니다." else log, 12f, Color.rgb(190, 208, 224), false)
-                .apply { typeface = Typeface.MONOSPACE },
-            margin(0, 8, 0, 0)
-        )
-        root.addView(logCard)
+            val arr=JSONArray(); trades.forEach { t -> arr.put(JSONObject().apply { put("s",t.symbol);put("d",t.detected);put("e",t.entry);put("sl",t.stop);put("tp",t.target);put("x",t.exit);put("xt",t.exitAt);put("r",t.result);put("why",t.reason) }) }
+            prefs.edit().putString("trades",arr.toString()).putLong("startedAt",detections.minOfOrNull { it.observedAt } ?: System.currentTimeMillis()).apply()
+            runOnUiThread { busy=false; render() }
+        }.start()
     }
 
-    private fun pct(value: Double): String = String.format(Locale.US, "%+.2f", value) + "%"
-
-    private fun matchCard(watch: Watch, m: ScanHistory.MatchRecord): LinearLayout {
-        val stopped = m.isTrackable && m.stopTime > 0L
-        val color = when {
-            stopped -> red
-            m.isTrackable && m.profitPct > 0.0 -> green
-            else -> white
-        }
-        val card = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(14), dp(14), dp(14), dp(12))
-            background = rounded(Color.argb(125, 25, 42, 62), dp(16), Color.argb(150, Color.red(color), Color.green(color), Color.blue(color)))
-        }
-
-        // Name on top
-        val head = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        head.addView(text(m.symbol, 19f, color, true), LinearLayout.LayoutParams(0, -2, 1f))
-        val detectedLabel = (if (m.candleLabel.isBlank()) "" else m.candleLabel + " · ") + "감지 " + timeFormat.format(Date(m.observedAt))
-        head.addView(text(detectedLabel, 11f, Color.rgb(174, 194, 211), false))
-        card.addView(head)
-
-        // 1. At the time of detection
-        val open = m.candleOpen
-        val high = if (m.highAtDetection > 0.0) m.highAtDetection else open * (1.0 + m.highPct / 100.0)
-        val volumePct = (m.volumeMultiple - 1.0) * 100.0
-        val lines = StringBuilder()
-        lines.append("① 감지 당시\n")
-        lines.append("   가격 ${formatPrice(m.price)} · 거래량 ${String.format(Locale.US, "%.2f", m.volumeMultiple)}배 (${pct(volumePct)})\n")
-        lines.append("   시가 ${formatPrice(open)} · 고가 ${formatPrice(high)} (${pct(m.highPct)}) · 종가 ${formatPrice(m.price)} (${pct(m.changePct)})")
-
-        if (!m.isTrackable) {
-            lines.append("\n(이전 버전 기록 · 추적 정보 없음)")
-        } else {
-            // 2. Current price
-            lines.append("\n② 현재 가격 ${formatPrice(m.currentPrice)} (감지 당시 대비 ${pct(m.profitPct)})")
-            if (m.lastPriceTime > 0L) lines.append(" · ${timeFormat.format(Date(m.lastPriceTime))} 기준")
-
-            // 3. Stop-loss
-            lines.append("\n③ 손절선 ${formatPrice(m.lowPrice)} (감지 당시 대비 ${pct(m.stopPct)}) · ")
-            if (stopped) lines.append("터치함 ${timeFormat.format(Date(m.stopTime))}") else lines.append("터치 안 함")
-
-            // 4. Peak within 5 days, excluding the detected candle
-            lines.append("\n④ 5일 고점 ")
-            val now = System.currentTimeMillis()
-            if (m.peakStart > 0L && now < m.peakStart) {
-                lines.append("감지된 봉이 마감된 뒤부터 집계 (${timeFormat.format(Date(m.peakStart))}~)")
-            } else if (m.peakPrice > m.price) {
-                lines.append("${formatPrice(m.peakPrice)} (진입가 대비 ${pct(m.peakPct)}, ${timeFormat.format(Date(m.peakTime))})")
-            } else {
-                lines.append("진입가 위로 오르지 않음")
+    private fun previousLow(symbol:String, observed:Long, n:Int):Double {
+        val hour=3600000L; val candleStart=observed/hour*hour; val start=candleStart-n*hour
+        val rows=apiKlines(symbol,"1h",start,candleStart-1, n.coerceAtMost(1000))
+        if(rows.length()==0) return 0.0
+        return rows.getJSONArray(rows.length()-1).getString(3).toDouble()
+    }
+    private fun scanExit(symbol:String, detected:Long, stop:Double, target:Double):Quad {
+        var start=detected/60000*60000; val end=System.currentTimeMillis(); var pages=0
+        while(start<end && pages<30) {
+            val rows=apiKlines(symbol,"1m",start,end,1000); if(rows.length()==0) break
+            for(i in 0 until rows.length()) {
+                val k=rows.getJSONArray(i); val ts=k.getLong(0); if(ts<detected)continue
+                val low=k.getString(3).toDouble(); val high=k.getString(2).toDouble()
+                // Conservative tie-break: if both levels are crossed in one candle, assume stop first.
+                if(low<=stop) return Quad(stop,ts,"손절","손절가 도달")
+                if(high>=target) return Quad(target,ts,"익절","익절가 도달")
             }
-            if (stopped && m.peakBeforeStop > m.price) lines.append("\n   손절 전 고점 ${pct(m.peakBeforeStopPct)}")
-            lines.append("\n   집계 종료 ${timeFormat.format(Date(m.windowEnd))}")
-            lines.append(if (m.done) " (종료됨)" else " (추적 중)")
+            val last=rows.getJSONArray(rows.length()-1).getLong(0)
+            if(rows.length()<1000 || last+60000<=start) break
+            start=last+60000; pages++
         }
-        card.addView(text(lines.toString(), 12.5f, color, false), margin(0, 8, 0, 8))
-
-        // Copy / delete
-        val buttons = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        val copy = button("종목명 복사", Color.rgb(0, 142, 116))
-        copy.setOnClickListener { copySymbol(m.symbol) }
-        val delete = button("삭제", Color.rgb(150, 60, 70))
-        delete.setOnClickListener { confirmDelete(watch, m) }
-        buttons.addView(copy, LinearLayout.LayoutParams(0, dp(40), 3f))
-        buttons.addView(delete, LinearLayout.LayoutParams(0, dp(40), 1f).apply { marginStart = dp(8) })
-        card.addView(buttons)
-        return card
+        val price=try { apiPrice(symbol) } catch(_:Exception){0.0}
+        return Quad(price,0L,"진행 중","익절·손절 미도달")
     }
-
-    private fun confirmDelete(watch: Watch, m: ScanHistory.MatchRecord) {
-        AlertDialog.Builder(this)
-            .setTitle("기록 삭제")
-            .setMessage("${m.symbol} (${timeFormat.format(Date(m.observedAt))} 감지) 기록을 삭제할까요?")
-            .setNegativeButton("취소", null)
-            .setPositiveButton("삭제") { _, _ ->
-                ScanHistory.deleteMatch(this, watch, m.symbol, m.observedAt)
-                buildScreen(watch)
-            }
-            .show()
+    private data class Quad(val first:Double,val second:Long,val third:String,val fourth:String)
+    private fun apiKlines(symbol:String, interval:String, start:Long, end:Long, limit:Int):JSONArray {
+        val url="https://fapi.binance.com/fapi/v1/klines?symbol=$symbol&interval=$interval&startTime=$start&endTime=$end&limit=$limit"
+        val c=URL(url).openConnection() as HttpURLConnection; c.connectTimeout=12000;c.readTimeout=20000
+        try { if(c.responseCode !in 200..299) throw IllegalStateException("Binance HTTP ${c.responseCode}"); return JSONArray(c.inputStream.bufferedReader().use{it.readText()}) } finally { c.disconnect() }
     }
+    private fun apiPrice(symbol:String):Double { val c=URL("https://fapi.binance.com/fapi/v1/ticker/price?symbol=$symbol").openConnection() as HttpURLConnection;c.connectTimeout=10000;c.readTimeout=10000;try{return JSONObject(c.inputStream.bufferedReader().use{it.readText()}).optDouble("price",0.0)}finally{c.disconnect()} }
 
-    private fun copySymbol(symbol: String) {
-        try {
-            val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-            clipboard.setPrimaryClip(ClipData.newPlainText("symbol", symbol))
-            Toast.makeText(this, "$symbol 복사됨", Toast.LENGTH_SHORT).show()
-        } catch (_: Exception) {
-            Toast.makeText(this, "복사하지 못했습니다.", Toast.LENGTH_SHORT).show()
-        }
+    private fun loadTrades():List<Trade> { val a=try{JSONArray(prefs.getString("trades","[]"))}catch(_:Exception){JSONArray()};return (0 until a.length()).map { val o=a.getJSONObject(it);Trade(o.optString("s"),o.optLong("d"),o.optDouble("e"),o.optDouble("sl"),o.optDouble("tp"),o.optDouble("x"),o.optLong("xt"),o.optString("r"),o.optString("why")) } }
+    private fun showSummary(trades:List<Trade>, initial:Double) {
+        val closed=trades.filter { it.exit>0 && it.exitAt>0 }; var balance=initial; var wins=0;var losses=0
+        closed.sortedBy { it.detected }.forEach { t -> val net=t.netPct/100.0; balance*=1+net; if(net>0)wins++ else losses++ }
+        val card=LinearLayout(this).apply { orientation=LinearLayout.VERTICAL;setPadding(dp(14),dp(14),dp(14),dp(14));background=rounded(Color.rgb(19,34,53)) }
+        card.addView(label("복리 결과",17f,fg,true)); card.addView(label("시작 원금  ${money(initial)} USDT",13f,muted,false),margin(0,7,0,0));card.addView(label("현재/최종 자산  ${money(balance)} USDT",19f,if(balance>=initial) Color.rgb(80,238,150) else Color.rgb(255,99,99),true),margin(0,5,0,0));card.addView(label("총수익률  ${pct((balance/initial-1)*100)}",15f,fg,true),margin(0,4,0,0))
+        val total= wins+losses;card.addView(label("익절 $wins회 · 손절 $losses회 · 승률 ${if(total>0) String.format(Locale.US,"%.2f",wins*100.0/total) else "0.00"}%",14f,fg,true),margin(0,8,0,0))
+        val started=prefs.getLong("startedAt",trades.minOfOrNull{it.detected}?:0L);val end=if(trades.any{it.result=="진행 중"})System.currentTimeMillis() else trades.maxOfOrNull{it.exitAt}?:System.currentTimeMillis()
+        card.addView(label("감시 기간: ${if(started>0)timeFmt.format(Date(started)) else "-"} ~ ${timeFmt.format(Date(end))}",12f,muted,false),margin(0,5,0,0));root.addView(card,margin(0,14,0,0))
     }
-
-    private fun formatPrice(value: Double): String =
-        if (value >= 1000) "%,.3f".format(Locale.US, value)
-        else "%.8f".format(Locale.US, value).trimEnd('0').trimEnd('.')
-
-    private fun card(): LinearLayout = LinearLayout(this).apply {
-        orientation = LinearLayout.VERTICAL
-        setPadding(dp(16), dp(16), dp(16), dp(16))
-        background = rounded(Color.argb(125, 25, 42, 62), dp(20), Color.argb(110, 111, 161, 184))
-    }
-
-    private fun text(value: String, size: Float, color: Int, bold: Boolean): TextView = TextView(this).apply {
-        text = value
-        textSize = size
-        setTextColor(color)
-        if (bold) typeface = Typeface.create("sans-serif", Typeface.BOLD)
-        setLineSpacing(dp(2).toFloat(), 1.02f)
-    }
-
-    private fun button(label: String, color: Int): Button = Button(this).apply {
-        text = label
-        textSize = 14f
-        isAllCaps = false
-        setTextColor(Color.WHITE)
-        background = rounded(color, dp(13))
-        stateListAnimator = null
-    }
-
-    private fun rounded(color: Int, radius: Int, stroke: Int = Color.TRANSPARENT) =
-        GradientDrawable().apply {
-            setColor(color)
-            cornerRadius = radius.toFloat()
-            if (stroke != Color.TRANSPARENT) setStroke(dp(1), stroke)
-        }
-
-    private fun margin(left: Int, top: Int, right: Int, bottom: Int) =
-        LinearLayout.LayoutParams(-1, -2).apply {
-            setMargins(dp(left), dp(top), dp(right), dp(bottom))
-        }
-
-    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+    private fun tradeCard(i:Int,t:Trade):LinearLayout { val c=LinearLayout(this).apply{orientation=LinearLayout.VERTICAL;setPadding(dp(13),dp(12),dp(13),dp(12));background=rounded(Color.rgb(19,34,53))};val col=if(t.result=="익절")Color.rgb(80,238,150) else if(t.result=="손절")Color.rgb(255,99,99) else fg
+        c.addView(label("$i. ${t.symbol}  (${timeFmt.format(Date(t.detected))})",16f,fg,true));c.addView(label("진입가 ${price(t.entry)} · 손절가 ${price(t.stop)} · 익절가 ${price(t.target)}",12f,muted,false),margin(0,6,0,0));c.addView(label("결과: ${t.result} · ${t.reason}",14f,col,true),margin(0,5,0,0));if(t.exit>0)c.addView(label("청산가 ${price(t.exit)} · 순손익(수수료 반영) ${pct(t.netPct)}",12f,col,false),margin(0,4,0,0));c.addView(label("소요 시간: ${if(t.exitAt>0)duration(t.exitAt-t.detected) else "진행 중"}",12f,muted,false),margin(0,4,0,0));return c }
+    private fun duration(ms:Long):String { val s=ms/1000;return if(s<3600) "${s/60}분 ${s%60}초" else if(s<86400) "${s/3600}시간 ${(s%3600)/60}분" else "${s/86400}일 ${(s%86400)/3600000}시간" }
+    private fun numberPref(k:String,d:Double)=prefs.getFloat(k,d.toFloat()).toDouble()
+    private fun numericInput(v:String,h:String)=EditText(this).apply{setText(v);hint=h;setTextColor(fg);setHintTextColor(muted);inputType=android.text.InputType.TYPE_CLASS_NUMBER or android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL;setPadding(dp(12),dp(6),dp(12),dp(6));background=rounded(Color.rgb(20,34,53))}
+    private fun button(s:String,color:Int,onClick:()->Unit)=Button(this).apply{text=s;setTextColor(Color.WHITE);textSize=13f;background=rounded(color);setOnClickListener{onClick()}}
+    private fun label(s:String,size:Float,color:Int,bold:Boolean)=TextView(this).apply{text=s;textSize=size;setTextColor(color);if(bold)setTypeface(null,android.graphics.Typeface.BOLD)}
+    private fun cardText(s:String)=LinearLayout(this).apply{setPadding(dp(14),dp(14),dp(14),dp(14));background=rounded(Color.rgb(19,34,53));addView(label(s,13f,muted,false))}
+    private fun rounded(color:Int)=GradientDrawable().apply{setColor(color);cornerRadius=dp(13).toFloat()}
+    private fun lp(w:Int,h:Int)=LinearLayout.LayoutParams(w,h)
+    private fun margin(l:Int,t:Int,r:Int,b:Int)=LinearLayout.LayoutParams(-1,-2).apply{setMargins(dp(l),dp(t),dp(r),dp(b))}
+    private fun dp(v:Int)= (v*resources.displayMetrics.density).toInt()
+    private fun money(v:Double)=String.format(Locale.US,"%,.4f",v)
+    private fun price(v:Double)=if(v<=0) "미확인" else String.format(Locale.US,"%.8f",v).trimEnd('0').trimEnd('.')
+    private fun pct(v:Double)=String.format(Locale.US,"%+.2f%%",v)
+    private fun toast(s:String)=Toast.makeText(this,s,Toast.LENGTH_LONG).show()
 }

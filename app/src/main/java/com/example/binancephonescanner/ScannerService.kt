@@ -466,32 +466,14 @@ class ScannerService : Service() {
         }
         appendLog(watch, logLine)
 
-        // One separate notification per detected coin. Always sent, even when the symbol is
-        // already in the history (a repeated detection is not recorded twice, but still alerts).
-        if (failureCount < symbols.size) matches.forEach { sendMatchNotification(watch, it) }
-
         // Keep the result for 5 days so the history screen can compare symbols over time.
-        // A symbol that already has a record still being followed (stop-loss not hit, 5-day
-        // window not over) is not recorded again: the earlier record stays. If the earlier
-        // record already hit its stop-loss, the new detection is saved as a new record.
         if (failureCount < symbols.size) {
             try {
-                var recordable: List<Match> = matches
-                if (matches.isNotEmpty()) {
-                    var open = ScanHistory.openSymbols(this, watch)
-                    if (matches.any { it.symbol in open }) {
-                        // Bring the earlier records up to date first, so a stop-loss that
-                        // happened since the last update is known before deciding.
-                        try { HistoryTracker.update(this, watch) } catch (_: Exception) {}
-                        open = ScanHistory.openSymbols(this, watch)
-                    }
-                    recordable = matches.filter { it.symbol !in open }
-                }
                 ScanHistory.append(
                     this, watch,
                     ScanHistory.ScanRecord(
                         System.currentTimeMillis(), symbols.size, failureCount,
-                        recordable.map {
+                        matches.map {
                             ScanHistory.MatchRecord(
                                 symbol = it.symbol,
                                 price = it.price,
@@ -517,6 +499,8 @@ class ScannerService : Service() {
             }
         }
 
+        // One separate notification per detected coin.
+        if (failureCount < symbols.size) matches.forEach { sendMatchNotification(watch, it) }
         // Follow up on earlier detections (stop-loss / 5-day peak). Alerts above go out first.
         updateServiceNotification("$tag 감지 종목 추적 결과 갱신 중…")
         try {
