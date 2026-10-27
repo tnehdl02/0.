@@ -1,1 +1,2 @@
 delete
+git rm -- "binance-phone-scanner-debug-apk (1).zip" git commit -m "Remove debug APK zip" git push
