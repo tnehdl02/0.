@@ -584,7 +584,7 @@ class ScannerService : Service() {
                 volumeMultiple >= cfg.volumeMultiple) {
                 Match(
                     symbol, livePrice, highPct, changePct, volumeMultiple, lowPrice, highPrice,
-                    System.currentTimeMillis(), openPrice, candleCloseTime + 1L, cfg.label
+                    System.currentTimeMillis(), openPrice, candleCloseTime + 0, cfg.label
                 )
             } else null
         } catch (_: Exception) {
